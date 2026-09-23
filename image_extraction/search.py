@@ -9,7 +9,7 @@ def require_faiss():
     try:
         import faiss
     except ImportError as error:
-        raise ValueError("FAISS is required. Install .[retrieval] for CPU support, or GPU-enabled FAISS separately.") from error
+        raise ValueError("FAISS is required. Install .[retrieval] for CPU support or .[gpu] for CUDA support.") from error
     return faiss
 
 
@@ -28,7 +28,7 @@ class ExactSearch:
         if device != "cpu":
             try:
                 if not hasattr(self.faiss, "StandardGpuResources") or self.faiss.get_num_gpus() < 1:
-                    raise RuntimeError("GPU-enabled FAISS and a visible CUDA device are required")
+                    raise RuntimeError("GPU-enabled FAISS and a visible CUDA device are required; replace faiss-cpu with .[gpu]")
                 resources = self.faiss.StandardGpuResources()
                 resources.setTempMemory(128 * 1024 * 1024)
                 # Probe actual kernels, not just driver/device visibility.
@@ -55,7 +55,9 @@ class ExactSearch:
     def metadata(self) -> dict:
         return {"requested_device": self.requested, "device": self.device,
                 "fallback_reason": self.fallback_reason, "faiss_version": self.faiss.__version__,
-                "metric": "inner_product", "precision": "float32", "exact": True}
+                "metric": "inner_product", "precision": "float32", "exact": True,
+                "index_type": type(self.index).__name__,
+                "gpu_device": 0 if self.device == "cuda" else None}
 
     def add(self, vectors: np.ndarray) -> None:
         self.index.add(self._vectors(vectors))

@@ -12,7 +12,9 @@ dependencies = ["Pillow>=11,<13", "huggingface-hub>=1,<2", "numpy>=2,<3"]
 
 [project.optional-dependencies]
 retrieval = ["faiss-cpu>=1.12,<2", "scenedetect>=0.7.1,<0.8", "opencv-python>=4.11,<5", "filelock>=3,<5"]
-# For environments where GPU-enabled FAISS is installed separately.
+# Install one FAISS provider only: retrieval (CPU) or gpu (CUDA).
+gpu = ["faiss-gpu==1.15.1", "scenedetect>=0.7.1,<0.8", "opencv-python>=4.11,<5", "filelock>=3,<5"]
+# For environments where FAISS is managed separately.
 video = ["scenedetect>=0.7.1,<0.8", "opencv-python>=4.11,<5", "filelock>=3,<5"]
 
 [project.scripts]

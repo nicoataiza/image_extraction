@@ -1,6 +1,7 @@
 """Functional checks for persistence, exact search, and video reports."""
 
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -239,22 +240,59 @@ class RetrievalTests(unittest.TestCase):
         self.assertNotIn('<img src=x onerror="alert(1)">', html)
         self.assertIn("&lt;img", html)
 
-    def test_gpu_matches_cpu_when_available(self):
+    def require_cuda(self, dimension=576):
         try:
-            gpu = ExactSearch(faiss.IndexFlatIP(16), "cuda")
+            return ExactSearch(faiss.IndexFlatIP(dimension), "cuda")
         except ValueError as error:
+            if os.environ.get("IMAGE_EXTRACTION_REQUIRE_CUDA") == "1":
+                self.fail(str(error))
             self.skipTest(str(error))
-        cpu = ExactSearch(faiss.IndexFlatIP(16), "cpu")
-        vectors = np.random.default_rng(41).normal(size=(30, 16)).astype(np.float32)
+
+    def test_gpu_matches_cpu_when_available(self):
+        gpu = self.require_cuda()
+        cpu = ExactSearch(faiss.IndexFlatIP(576), "cpu")
+        vectors = np.random.default_rng(41).normal(size=(4096, 576)).astype(np.float32)
         vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
         for backend in (cpu, gpu):
             backend.add(vectors)
-        cpu_scores, cpu_ids = cpu.search(vectors[:4], 10)
-        gpu_scores, gpu_ids = gpu.search(vectors[:4], 10)
+        for top_k in (10, 2048):
+            cpu_scores, cpu_ids = cpu.search(vectors[:4], top_k)
+            gpu_scores, gpu_ids = gpu.search(vectors[:4], top_k)
+            np.testing.assert_allclose(cpu_scores, gpu_scores, atol=1e-5)
+            # Scores separated by <1e-6 may exchange rank across backends.
+            for row in range(len(cpu_ids)):
+                reference = vectors[gpu_ids[row]] @ vectors[row]
+                np.testing.assert_allclose(reference, cpu_scores[row], atol=1e-6)
+        portable = gpu.cpu_index()
+        np.testing.assert_allclose(portable.reconstruct_n(0, len(vectors)), vectors, atol=1e-6)
+
+    def test_gpu_build_resume_portable_load_and_video_query(self):
+        self.require_cuda()
+        result = build_index(self.images, self.index, search_device="cuda", batch_size=2)
+        self.assertEqual(result["search"]["device"], "cuda")
+        self.assertEqual(result["search"]["index_type"], "GpuIndexFlat")
+        with patch.object(SpatialDescriptor, "extract", side_effect=AssertionError("decoded on resume")):
+            resumed = build_index(self.images, self.index, search_device="cuda")
+        self.assertEqual(resumed["reused_candidates"], 3)
+        _, mapping, _, cpu = load_index(self.index, search_device="cpu")
+        _, _, _, gpu = load_index(self.index, search_device="auto")
+        self.assertEqual(gpu.device, "cuda")
+        vectors = cpu.cpu_index().reconstruct_n(0, len(mapping))
+        cpu_scores, cpu_ids = cpu.search(vectors, 3)
+        gpu_scores, gpu_ids = gpu.search(vectors, 3)
         np.testing.assert_allclose(cpu_scores, gpu_scores, atol=1e-5)
         np.testing.assert_array_equal(cpu_ids, gpu_ids)
-        portable = gpu.cpu_index()
-        np.testing.assert_allclose(portable.reconstruct_n(0, 30), vectors, atol=1e-6)
+        summary = query_video(self.video(), self.index, self.output,
+                              search_device="cuda", min_scene_frames=5)
+        self.assertEqual(summary["search"]["device"], "cuda")
+        self.assertEqual(summary["query_count"], 2)
+        # A portable CPU-built artifact must also load and search on CUDA.
+        cpu_index = self.root / "cpu-index"
+        build_index(self.images, cpu_index, search_device="cpu")
+        _, _, _, transferred = load_index(cpu_index, search_device="cuda")
+        scores, ids = transferred.search(vectors, 3)
+        np.testing.assert_allclose(scores, cpu_scores, atol=1e-5)
+        np.testing.assert_array_equal(ids, cpu_ids)
 
 
 if __name__ == "__main__":
