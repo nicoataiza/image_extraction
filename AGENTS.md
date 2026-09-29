@@ -463,3 +463,28 @@ A successful initial prototype produces inspectable per-shot matches and reprodu
 ## Initial boundaries
 
 The first implementation is local and single-user, with a CLI and static reports. It does not require a hosted service, an interactive web application, model training, semantic scene grouping, or copying the original collection into a second repository. Composition quality, generalization across subjects, and the best descriptor remain experimental questions.
+
+## Semantic indexing implementation (September 28, 2026)
+
+`index --descriptor semantic` now supports pinned SigLIP 2 base NaFlex image
+embeddings, bounded CPU/CUDA inference batches, resumable SQLite checkpoints,
+and portable CPU/GPU FAISS search. See README's **Semantic reference-image index**
+section for installation and full-collection commands. Semantic dependencies are
+optional and do not switch FAISS providers. Spatial defaults remain unchanged.
+The `query` command loads the stored encoder and supports batched semantic
+encoding. Reference-guided heuristic selection is now available below;
+object-completeness assessment still needs visual review. No part labels or ground-truth video frames have been added.
+
+Verification: 55 tests passed with `IMAGE_EXTRACTION_REQUIRE_CUDA=1`; dependency
+check passed. All 19 photos in stock `173097` produced normalized semantic vectors
+using CUDA, then matched themselves at rank 1 using CPU-extracted query vectors.
+Maximum CPU/GPU embedding difference was `4.45e-6`; search-score difference was
+`2.39e-7`. Resume reused all 19 entries without loading the encoder. Evidence:
+`outputs/semantic-smoke-173097.json`. This is functional validation, not a
+retrieval-quality evaluation or full-collection benchmark. The full semantic
+collection index completed on September 28, 2026: 238,659 usable images, zero
+invalid images, CUDA extraction/search, 3,963.9 seconds total. The index is
+`artifacts/wcp-all-semantic/`. VA14022 was queried against it with half-second
+interval sampling: 382 frames across 18 shots, ten semantic matches per frame,
+53.6 seconds total, no thumbnail errors. Report:
+`outputs/VA14022/wcp-semantic/report.html`. Retrieval quality remains unevaluated.

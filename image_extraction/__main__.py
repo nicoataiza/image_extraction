@@ -104,7 +104,13 @@ def main(argv: list[str] | None = None) -> int:
     index.add_argument("--images", type=Path, default=Path("data/car-images"))
     index.add_argument("--index", type=Path, default=Path("artifacts/car-images"))
     index.add_argument("--search-device", choices=("auto", "cpu", "cuda"), default="auto")
-    index.add_argument("--batch-size", type=positive_int, default=64)
+    index.add_argument("--batch-size", type=positive_int, default=64, help="FAISS add batch size")
+    index.add_argument("--descriptor", choices=("spatial", "semantic"), default="spatial")
+    index.add_argument("--extraction-device", choices=("auto", "cpu", "cuda"), default="auto")
+    index.add_argument("--extraction-batch-size", type=positive_int, default=16,
+                       help="Maximum decoded images per semantic inference batch")
+    index.add_argument("--model-cache", type=Path, help="Semantic model cache (default: project .cache/models)")
+    index.add_argument("--semantic-max-patches", type=int, choices=(256, 512, 1024), default=256)
     index.add_argument("--descriptor-max-side", type=positive_int,
                        help="Optionally downsize descriptor input; default retains native resolution")
     index.add_argument("--rebuild", action="store_true", help="Recompute checkpoints and replace this index's generated artifacts")
@@ -113,6 +119,8 @@ def main(argv: list[str] | None = None) -> int:
     query.add_argument("--index", type=Path, default=Path("artifacts/car-images"))
     query.add_argument("--output", type=Path, default=Path("outputs/video-query"))
     query.add_argument("--search-device", choices=("auto", "cpu", "cuda"), default="auto")
+    query.add_argument("--extraction-device", choices=("auto", "cpu", "cuda"), default="auto")
+    query.add_argument("--model-cache", type=Path)
     query.add_argument("--top-k", type=positive_int, default=10)
     query.add_argument("--batch-size", type=positive_int, default=16)
     query.add_argument("--interval-seconds", type=positive_float, help="Add interval samples within shots, alongside each midpoint")
@@ -135,14 +143,25 @@ def main(argv: list[str] | None = None) -> int:
             from .indexing import build_index
             from .descriptors import SpatialDescriptor
 
-            descriptor = SpatialDescriptor(max_side=args.descriptor_max_side)
+            if args.descriptor == "semantic":
+                if args.descriptor_max_side is not None:
+                    raise ValueError("--descriptor-max-side applies only to spatial descriptors")
+                from .semantic import SemanticDescriptor
+                descriptor = SemanticDescriptor(device=args.extraction_device, cache_dir=args.model_cache,
+                                                max_num_patches=args.semantic_max_patches)
+            else:
+                if args.extraction_device == "cuda":
+                    raise ValueError("Spatial extraction runs on CPU; use --descriptor semantic for CUDA extraction")
+                descriptor = SpatialDescriptor(max_side=args.descriptor_max_side)
             print(json.dumps(build_index(args.images, args.index, search_device=args.search_device,
-                                         batch_size=args.batch_size, rebuild=args.rebuild, descriptor=descriptor), indent=2))
+                                         batch_size=args.batch_size, rebuild=args.rebuild, descriptor=descriptor,
+                                         extraction_batch_size=args.extraction_batch_size), indent=2))
         elif args.command == "query":
             from .query import query_video
 
             print(json.dumps(query_video(args.video, args.index, args.output, top_k=args.top_k,
                                          search_device=args.search_device, batch_size=args.batch_size,
+                                         extraction_device=args.extraction_device, model_cache=args.model_cache,
                                          interval_seconds=args.interval_seconds, threshold=args.threshold,
                                          min_scene_frames=args.min_scene_frames), indent=2))
         else:

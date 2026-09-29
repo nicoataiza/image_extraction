@@ -41,9 +41,9 @@ def ensure_separate(first: Path, second: Path) -> None:
 
 
 def build_index(images, index, *, search_device="auto", batch_size=64, rebuild=False,
-                descriptor=None) -> dict:
-    if batch_size <= 0:
-        raise ValueError("batch_size must be positive")
+                descriptor=None, extraction_batch_size=16) -> dict:
+    if batch_size <= 0 or extraction_batch_size <= 0:
+        raise ValueError("batch sizes must be positive")
     descriptor = descriptor or SpatialDescriptor()
     dataset = ImageDataset(images)
     destination = Path(index).expanduser().resolve()
@@ -56,12 +56,12 @@ def build_index(images, index, *, search_device="auto", batch_size=64, rebuild=F
     destination.mkdir(parents=True, exist_ok=True)
     try:
         with FileLock(str(destination / ".index.lock"), timeout=0):
-            return _build(dataset, destination, descriptor, faiss, search_device, batch_size, rebuild)
+            return _build(dataset, destination, descriptor, faiss, search_device, batch_size, rebuild, extraction_batch_size)
     except Timeout as error:
         raise ValueError("Another process is building this index") from error
 
 
-def _build(dataset, destination, descriptor, faiss, search_device, batch_size, rebuild):
+def _build(dataset, destination, descriptor, faiss, search_device, batch_size, rebuild, extraction_batch_size):
     started = time.perf_counter()
     manifest_path = destination / "manifest.json"
     database_path = destination / "entries.sqlite"
@@ -88,48 +88,8 @@ def _build(dataset, destination, descriptor, faiss, search_device, batch_size, r
             with db:
                 db.execute("DELETE FROM entries")
                 db.execute("INSERT OR REPLACE INTO settings VALUES (1, ?)", (json.dumps(settings),))
-        reused = extracted = 0
-        extraction_seconds = 0.0
-        for number, entry in enumerate(entries):
-            cached = db.execute("SELECT metadata FROM entries WHERE path=?", (entry["relative_path"],)).fetchone()
-            if cached:
-                saved = json.loads(cached[0])
-                if any(saved.get(key) != value for key, value in entry.items()):
-                    raise ValueError("Descriptor checkpoint does not match source inventory; use --rebuild")
-                reused += 1
-                continue
-            tick = time.perf_counter()
-            vector, failure = None, None
-            metadata = dict(entry)
-            try:
-                sample = dataset[number]
-            except ImageLoadError as error:
-                failure = error.reason
-                print(str(error), file=sys.stderr)
-            else:
-                try:
-                    vector = descriptor.extract(sample.image)
-                    if (vector.shape != (descriptor.dimension,) or vector.dtype != np.float32
-                            or not np.isfinite(vector).all()):
-                        raise ValueError("Descriptor returned invalid data")
-                    norm = float(np.linalg.norm(vector))
-                    if norm != 0 and not np.isclose(norm, 1, atol=1e-5):
-                        raise ValueError("Descriptor is not normalized")
-                    metadata.update(width=sample.source_size[0], height=sample.source_size[1], zero_vector=norm == 0)
-                finally:
-                    sample.close()
-            stat = dataset.paths[number].stat()
-            if (stat.st_size, stat.st_mtime_ns) != (entry["size_bytes"], entry["mtime_ns"]):
-                raise ValueError("An image changed during extraction; rerun with --rebuild")
-            # One transaction per file: interruption loses at most the current image.
-            with db:
-                db.execute("INSERT INTO entries VALUES (?, ?, ?, ?)", (
-                    entry["relative_path"], json.dumps(metadata),
-                    None if vector is None else vector.tobytes(), failure))
-            extraction_seconds += time.perf_counter() - tick
-            extracted += 1
-            if (number + 1) % 100 == 0:
-                print(f"Indexed {number + 1}/{len(entries)} candidates", file=sys.stderr)
+        reused, extracted, extraction_seconds = _extract_entries(
+            dataset, entries, descriptor, db, extraction_batch_size)
         if inventory(ImageDataset(dataset.root)) != entries:
             raise ValueError("Image collection changed during indexing; rerun with --rebuild")
         add_seconds = 0.0
@@ -173,6 +133,9 @@ def _build(dataset, destination, descriptor, faiss, search_device, batch_size, r
         manifest.update(status="complete", search=backend.metadata(),
                         completed_at=datetime.now(timezone.utc).isoformat(),
                         python_version=platform.python_version(), batch_size=batch_size,
+                        extraction_batch_size=extraction_batch_size if hasattr(descriptor, "extract_batch") else 1,
+                        extraction=(descriptor.runtime_metadata() if hasattr(descriptor, "runtime_metadata")
+                                    else {"device": "cpu"}),
                         timings_seconds={"extraction_and_checkpoint": extraction_seconds,
                                          "vector_index_add": add_seconds, "index_save": save_seconds,
                                          "total": time.perf_counter() - started},
@@ -184,7 +147,7 @@ def _build(dataset, destination, descriptor, faiss, search_device, batch_size, r
         return manifest
 
 
-def load_index(index, *, search_device="auto"):
+def load_index(index, *, search_device="auto", extraction_device="auto", model_cache=None):
     destination = Path(index).expanduser().resolve()
     if not (destination / "manifest.json").is_file():
         raise ValueError(f"No index manifest found in {destination}; run index first")
@@ -195,17 +158,22 @@ def load_index(index, *, search_device="auto"):
     try:
         # Hold the build lock until all artifacts have been verified and loaded.
         with FileLock(str(destination / ".index.lock"), timeout=0):
-            return _load_index(destination, search_device)
+            return _load_index(destination, search_device, extraction_device, model_cache)
     except Timeout as error:
         raise ValueError("Index is currently being rebuilt; retry after indexing completes") from error
 
 
-def _load_index(destination, search_device):
+def _load_index(destination, search_device, extraction_device="auto", model_cache=None):
     manifest = json.loads((destination / "manifest.json").read_text())
     if manifest.get("schema_version") != INDEX_SCHEMA or manifest.get("status") != "complete":
         raise ValueError("Index is incompatible or incomplete; build/resume it before querying")
     try:
-        descriptor = SpatialDescriptor(**manifest["descriptor"]["parameters"])
+        from .semantic import SEMANTIC_VERSION, SemanticDescriptor
+        settings = manifest["descriptor"]
+        if settings.get("version") == SEMANTIC_VERSION:
+            descriptor = SemanticDescriptor(**settings["parameters"], device=extraction_device, cache_dir=model_cache)
+        else:
+            descriptor = SpatialDescriptor(**settings["parameters"])
         if descriptor.metadata() != manifest["descriptor"]:
             raise ValueError("Index descriptor is incompatible; rebuild the index")
         for name in ("index.faiss", "images.jsonl", "errors.jsonl"):
@@ -225,3 +193,76 @@ def _load_index(destination, search_device):
     except (KeyError, TypeError) as error:
         raise ValueError("Invalid index manifest or image mapping") from error
     return manifest, images, descriptor, ExactSearch(cpu, search_device)
+
+
+def _extract_entries(dataset, entries, descriptor, db, extraction_batch_size):
+    """Commit bounded inference batches atomically; never decode cached entries."""
+    limit = extraction_batch_size if hasattr(descriptor, "extract_batch") else 1
+    pending = []
+    reused = extracted = 0
+    elapsed = 0.0
+
+    def flush():
+        nonlocal extracted
+        samples = []
+        records = []
+        try:
+            for number, entry in pending:
+                metadata = dict(entry)
+                try:
+                    sample = dataset[number]
+                except ImageLoadError as error:
+                    print(str(error), file=sys.stderr)
+                    records.append((number, metadata, None, error.reason))
+                else:
+                    samples.append(sample)
+                    metadata.update(width=sample.source_size[0], height=sample.source_size[1])
+                    records.append((number, metadata, len(samples) - 1, None))
+            if samples:
+                if hasattr(descriptor, "extract_batch"):
+                    vectors = descriptor.extract_batch([sample.image for sample in samples])
+                else:
+                    vectors = np.stack([descriptor.extract(sample.image) for sample in samples])
+                if (vectors.shape != (len(samples), descriptor.dimension) or vectors.dtype != np.float32
+                        or not np.isfinite(vectors).all()):
+                    raise ValueError("Descriptor returned invalid data")
+                norms = np.linalg.norm(vectors, axis=1)
+                if not np.all((norms == 0) | np.isclose(norms, 1, atol=1e-5)):
+                    raise ValueError("Descriptor is not normalized")
+            # A failed inference or interrupted transaction leaves this whole batch uncached.
+            with db:
+                for number, metadata, row, failure in records:
+                    stat = dataset.paths[number].stat()
+                    if (stat.st_size, stat.st_mtime_ns) != (metadata["size_bytes"], metadata["mtime_ns"]):
+                        raise ValueError("An image changed during extraction; rerun with --rebuild")
+                    if row is not None:
+                        metadata["zero_vector"] = bool(norms[row] == 0)
+                    db.execute("INSERT INTO entries VALUES (?, ?, ?, ?)", (
+                        metadata["relative_path"], json.dumps(metadata),
+                        None if row is None else vectors[row].tobytes(), failure))
+            extracted += len(pending)
+            if limit > 1 or (reused + extracted) % 100 == 0:
+                print(f"Indexed {reused + extracted}/{len(entries)} candidates ({reused} reused)", file=sys.stderr)
+        finally:
+            for sample in samples:
+                sample.close()
+            pending.clear()
+
+    for number, entry in enumerate(entries):
+        cached = db.execute("SELECT metadata FROM entries WHERE path=?", (entry["relative_path"],)).fetchone()
+        if cached:
+            saved = json.loads(cached[0])
+            if any(saved.get(key) != value for key, value in entry.items()):
+                raise ValueError("Descriptor checkpoint does not match source inventory; use --rebuild")
+            reused += 1
+            continue
+        pending.append((number, entry))
+        if len(pending) >= limit:
+            tick = time.perf_counter()
+            flush()
+            elapsed += time.perf_counter() - tick
+    if pending:
+        tick = time.perf_counter()
+        flush()
+        elapsed += time.perf_counter() - tick
+    return reused, extracted, elapsed

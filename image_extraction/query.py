@@ -28,7 +28,8 @@ def save_query_frame(image, path):
 
 
 def query_video(video, index, output, *, top_k=10, search_device="auto", batch_size=16,
-                interval_seconds=None, threshold=27.0, min_scene_frames=15) -> dict:
+                interval_seconds=None, threshold=27.0, min_scene_frames=15,
+                extraction_device="auto", model_cache=None) -> dict:
     if top_k <= 0 or top_k > 2048 or batch_size <= 0:
         raise ValueError("top_k must be 1..2048 and batch_size must be positive")
     if interval_seconds is not None and (not math.isfinite(interval_seconds) or interval_seconds <= 0):
@@ -44,7 +45,8 @@ def query_video(video, index, output, *, top_k=10, search_device="auto", batch_s
     if output.exists() and any(output.iterdir()):
         raise ValueError("Report directory is not empty; use a new --output directory")
     started = time.perf_counter()
-    manifest, images, descriptor, backend = load_index(index, search_device=search_device)
+    manifest, images, descriptor, backend = load_index(index, search_device=search_device,
+                                                       extraction_device=extraction_device, model_cache=model_cache)
     load_seconds = time.perf_counter() - started
     source_root = Path(manifest["images_root"])
     ensure_separate(source_root, output)
@@ -89,6 +91,15 @@ def query_video(video, index, output, *, top_k=10, search_device="auto", batch_s
         return relative
 
     def flush(batch):
+        if hasattr(descriptor, "extract_batch"):
+            tick = time.perf_counter()
+            try:
+                vectors = descriptor.extract_batch([item[0] for item in batch])
+            finally:
+                for pixels, _ in batch:
+                    pixels.close()
+            timing["query_encoding"] += time.perf_counter() - tick
+            batch = [(vector, item[1]) for vector, item in zip(vectors, batch)]
         tick = time.perf_counter()
         scores, ids = backend.search(np.stack([item[0] for item in batch]), top_k)
         elapsed = time.perf_counter() - tick
@@ -119,15 +130,15 @@ def query_video(video, index, output, *, top_k=10, search_device="auto", batch_s
                 raise ValueError(f"Timestamp mismatch while decoding selected frame {number}")
             with Image.fromarray(pixels) as image:
                 tick = time.perf_counter()
-                vector = descriptor.extract(image)
-                timing["query_encoding"] += time.perf_counter() - tick
-                tick = time.perf_counter()
                 thumbnail = f"queries/frame-{number:08d}.jpg"
                 save_query_frame(image, output / thumbnail)
                 timing["thumbnails"] += time.perf_counter() - tick
+                tick = time.perf_counter()
+                vector = image.copy() if hasattr(descriptor, "extract_batch") else descriptor.extract(image)
+                timing["query_encoding"] += time.perf_counter() - tick
             query = {"frame_number": number, "timestamp_seconds": timestamps[number],
                      "thumbnail": thumbnail, "width": pixels.shape[1], "height": pixels.shape[0],
-                     "zero_vector": bool(not np.any(vector))}
+                     "zero_vector": False if hasattr(descriptor, "extract_batch") else bool(not np.any(vector))}
             shot["queries"].append(query)
             batch.append((vector, query))
             if len(batch) >= batch_size:
@@ -137,13 +148,18 @@ def query_video(video, index, output, *, top_k=10, search_device="auto", batch_s
             flush(batch)
     finally:
         frame_reader.close()
+        if hasattr(descriptor, "extract_batch"):
+            for pixels, _ in batch:
+                pixels.close()
     if (video.stat().st_size, video.stat().st_mtime_ns) != (video_stat.st_size, video_stat.st_mtime_ns):
         raise ValueError("Source video changed during processing")
     results = {"schema_version": 1, "status": "complete", "video": video_info,
                "index": {"path": str(index), "images": len(images),
                          "sha256": manifest["files"]["index.faiss"]["sha256"],
                          "descriptor": manifest["descriptor"]},
-               "search": backend.metadata(), "top_k": top_k, "batch_size": batch_size,
+               "search": backend.metadata(),
+               "extraction": descriptor.runtime_metadata() if hasattr(descriptor, "runtime_metadata") else {"device": "cpu"},
+               "top_k": top_k, "batch_size": batch_size,
                "interval_seconds": interval_seconds, "query_count": len(selected), "shot_count": len(shots),
                "shots": shots, "thumbnail_errors": thumbnail_errors,
                "query_frame_export": {"resolution": "native", "format": "JPEG", "quality": 95},
@@ -165,7 +181,10 @@ def query_video(video, index, output, *, top_k=10, search_device="auto", batch_s
 
 
 def render_report(results, path):
-    title = f"Composition matches · {Path(results['video']['path']).name}"
+    semantic = results["index"]["descriptor"]["version"].startswith("siglip2-")
+    title = f"{'Semantic' if semantic else 'Composition'} matches · {Path(results['video']['path']).name}"
+    description = ("Semantic image similarity (SigLIP 2). Scores do not measure composition quality or prove part presence."
+                   if semantic else "Spatial grayscale/edge baseline.")
     with path.open("w", encoding="utf-8") as stream:
         stream.write(f"""<!doctype html><html lang="en"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>{escape(title)}</title>
@@ -176,7 +195,7 @@ h1{{margin-bottom:8px}}a{{color:#97caff}}.meta{{color:#a9b7c9}}section{{margin:3
 figcaption{{overflow-wrap:anywhere;margin-top:8px;font-size:13px}}.missing{{height:155px;display:grid;place-items:center}}
 </style><h1>{escape(title)}</h1>
 <p class="meta">{results['shot_count']} shots · {results['query_count']} query frames · {results['index']['images']} indexed images · {escape(results['search']['device'])} exact search</p>
-<p>Spatial grayscale/edge baseline. Scores indicate ranking similarity, not probabilities. <a href="results.json">Download JSON results</a></p>""")
+<p>{description} Scores indicate ranking similarity, not probabilities. <a href="results.json">Download JSON results</a></p>""")
         if results["search"]["fallback_reason"]:
             stream.write(f"<p class=meta>CPU fallback: {escape(results['search']['fallback_reason'])}</p>")
         if results["thumbnail_errors"]:
