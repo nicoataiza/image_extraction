@@ -126,6 +126,19 @@ def main(argv: list[str] | None = None) -> int:
     query.add_argument("--interval-seconds", type=positive_float, help="Add interval samples within shots, alongside each midpoint")
     query.add_argument("--threshold", type=positive_float, default=27.0, help="ContentDetector cut threshold")
     query.add_argument("--min-scene-frames", type=positive_int, default=15)
+    select = commands.add_parser("select-frames", help="Rank semantic query frames and select distinct photos")
+    select.add_argument("--results", type=Path, required=True, help="Completed semantic query results.json")
+    select.add_argument("--output", type=Path, required=True)
+    select.add_argument("--top-k", type=positive_int, default=17)
+    select.add_argument("--batch-size", type=positive_int, default=16)
+    select.add_argument("--extraction-device", choices=("auto", "cpu", "cuda"), default="auto")
+    select.add_argument("--search-device", choices=("auto", "cpu", "cuda"), default="auto")
+    select.add_argument("--feedback-profile", type=Path, help="Explicit JSON mapping of workbook visual examples")
+    select.add_argument("--review", type=Path, help="Optional reviewed frame IDs/reasons bound to the input checksum")
+    select.add_argument("--min-relevance", type=float, default=0.65, help="Uncalibrated relevance cutoff; default 0.65")
+    replay = commands.add_parser("replay-selection", help="Reproduce automatic selections from saved scores; no model inference")
+    replay.add_argument("--selection", type=Path, required=True)
+    replay.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "download":
@@ -156,6 +169,18 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(build_index(args.images, args.index, search_device=args.search_device,
                                          batch_size=args.batch_size, rebuild=args.rebuild, descriptor=descriptor,
                                          extraction_batch_size=args.extraction_batch_size), indent=2))
+        elif args.command == "replay-selection":
+            from .selection import replay_selection
+
+            print(json.dumps(replay_selection(args.selection, args.output), indent=2))
+        elif args.command == "select-frames":
+            from .selection import select_video_frames
+
+            print(json.dumps(select_video_frames(
+                args.results, args.output, top_k=args.top_k, batch_size=args.batch_size,
+                extraction_device=args.extraction_device, search_device=args.search_device,
+                feedback_profile=args.feedback_profile, review_path=args.review,
+                min_relevance=args.min_relevance), indent=2))
         elif args.command == "query":
             from .query import query_video
 

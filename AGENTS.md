@@ -488,3 +488,40 @@ invalid images, CUDA extraction/search, 3,963.9 seconds total. The index is
 interval sampling: 382 frames across 18 shots, ten semantic matches per frame,
 53.6 seconds total, no thumbnail errors. Report:
 `outputs/VA14022/wcp-semantic/report.html`. Retrieval quality remains unevaluated.
+
+## Reference-guided frame selection (September 28, 2026)
+
+`select-frames` now scores semantic query candidates using distinct collection
+references, sharpness/exposure proxies, reference layout and explicitly mapped
+workbook visual examples. It proposes a diverse set and optionally records an
+explicit visual-review override, with frame/source checksums and reasons. See
+README's selection section for commands, profile/review formats and limitations.
+The frame-selector thresholds and weights are development heuristics, not a
+validated part detector or completeness/readability metric. The reviewed VA14022
+set has 17 frames at `outputs/VA14022/wcp-selected/report.html`, including both
+plates and an illuminated cluster. The best available engine detail remains
+tighter than the requested full-bay overview. Collection part labels and
+held-out correctness labels for video frames have not been created.
+
+Selection validation: all 66 tests passed, including required CUDA checks.
+The reviewed output contains 17 distinct frame IDs, each exported at 1920×1080
+with a byte-for-byte match to its sampled source JPEG. Reference thumbnails and
+review/input checksums were verified. This confirms artifact correctness; it
+does not establish general automatic selection quality.
+
+## Repeatable automatic selection (September 28, 2026)
+
+The automatic path now uses `reference-quality-diversity-v2`, with the pure
+selection policy in `image_extraction/selection_decisions.py`. It records every
+comparison pool, runner-up, score contribution, redundancy penalty, and final
+exclusion status. Six-decimal utilities use the lower frame number for ties.
+`replay-selection` recomputes decisions from checksummed frozen similarities and
+component scores without model inference; it rejects manual-review results and
+changed decision code/evidence. No hand-picked frame IDs are used in the current
+automatic report: `outputs/VA14022/wcp-selected-repeatable/report.html`. The older
+`wcp-selected/` report remains an explicitly assistant-reviewed result. All 70
+tests passed, including required CUDA checks and replay/tamper tests. Exact replay
+of the real 17-frame automatic result and its decision trace succeeded.
+Two independent automatic VA14022 runs also produced identical 17-frame IDs and
+all 4,508 decision comparisons. Evidence: `outputs/VA14022/selection-repeatability.json`.
+This is same-environment repeatability, not a cross-hardware inference guarantee.
