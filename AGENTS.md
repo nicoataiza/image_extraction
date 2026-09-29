@@ -1,3 +1,11 @@
+> Current extraction settings (September 23, 2026): new indexes default to native
+> image resolution (`max_side=None`, `spatial-gray-edge-v2-native`). Query frames
+> are exported at native resolution and encoded using the index's stored settings.
+> Explicit `max_side=256` preserves the v1 descriptor and old index compatibility;
+> `index --descriptor-max-side 256` selects it. Changing resolution requires a new
+> index or `--rebuild`. The synthetic evaluator retains the published v1 baseline.
+> Historical 256-pixel measurements below do not describe the native mode.
+
 # Video-to-image composition retrieval
 
 Given a video, find images in a local collection with similar composition: subject placement, relative scale, framing, and foreground/background arrangement. Images may contain different subjects and still be good matches.

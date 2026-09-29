@@ -105,6 +105,8 @@ def main(argv: list[str] | None = None) -> int:
     index.add_argument("--index", type=Path, default=Path("artifacts/car-images"))
     index.add_argument("--search-device", choices=("auto", "cpu", "cuda"), default="auto")
     index.add_argument("--batch-size", type=positive_int, default=64)
+    index.add_argument("--descriptor-max-side", type=positive_int,
+                       help="Optionally downsize descriptor input; default retains native resolution")
     index.add_argument("--rebuild", action="store_true", help="Recompute checkpoints and replace this index's generated artifacts")
     query = commands.add_parser("query", help="Retrieve per-shot image matches and write JSON/HTML reports")
     query.add_argument("--video", type=Path, required=True)
@@ -131,9 +133,11 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(evaluate_synthetic(args.dataset, args.output, split=args.split), indent=2))
         elif args.command == "index":
             from .indexing import build_index
+            from .descriptors import SpatialDescriptor
 
+            descriptor = SpatialDescriptor(max_side=args.descriptor_max_side)
             print(json.dumps(build_index(args.images, args.index, search_device=args.search_device,
-                                         batch_size=args.batch_size, rebuild=args.rebuild), indent=2))
+                                         batch_size=args.batch_size, rebuild=args.rebuild, descriptor=descriptor), indent=2))
         elif args.command == "query":
             from .query import query_video
 

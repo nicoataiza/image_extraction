@@ -6,6 +6,7 @@ import numpy as np
 from PIL import Image, ImageFilter, ImageOps
 
 DESCRIPTOR_VERSION = "spatial-gray-edge-v1"
+NATIVE_DESCRIPTOR_VERSION = "spatial-gray-edge-v2-native"
 
 
 @dataclass(frozen=True)
@@ -15,20 +16,23 @@ class SpatialDescriptor:
     Cells cover relative positions in the original frame. Grayscale cell means
     and magnitude-weighted edge histograms are independently L2 normalized,
     equally weighted by default, concatenated, and L2 normalized again.
+    Native resolution is retained unless max_side explicitly requests downsizing.
     Uniform images produce a zero vector: they carry no layout evidence.
     """
 
     grid_size: int = 8
     orientation_bins: int = 8
-    max_side: int = 256
+    max_side: int | None = None
     blur_radius: float = 1.0
     intensity_weight: float = 0.5
 
     def __post_init__(self):
-        for name in ("grid_size", "orientation_bins", "max_side"):
+        for name in ("grid_size", "orientation_bins"):
             value = getattr(self, name)
             if not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if self.max_side is not None and (not isinstance(self.max_side, int) or self.max_side <= 0):
+            raise ValueError("max_side must be a positive integer or None for native resolution")
         if not np.isfinite(self.blur_radius) or self.blur_radius < 0:
             raise ValueError("blur_radius must be finite and nonnegative")
         if not np.isfinite(self.intensity_weight) or not 0 <= self.intensity_weight <= 1:
@@ -40,12 +44,14 @@ class SpatialDescriptor:
 
     def metadata(self) -> dict:
         return {
-            "version": DESCRIPTOR_VERSION,
+            "version": NATIVE_DESCRIPTOR_VERSION if self.max_side is None else DESCRIPTOR_VERSION,
             "parameters": asdict(self),
             "dimension": self.dimension,
             "dtype": "float32",
             "normalization": "block-l2, weighted concatenation, final-l2; uniform=zero",
-            "preprocessing": "EXIF orientation, grayscale, aspect-preserving thumbnail, Gaussian blur; no padding",
+            "preprocessing": ("EXIF orientation, grayscale, native resolution, Gaussian blur; no padding"
+                              if self.max_side is None else
+                              "EXIF orientation, grayscale, aspect-preserving thumbnail, Gaussian blur; no padding"),
         }
 
     def extract(self, image: Image.Image) -> np.ndarray:
@@ -56,7 +62,8 @@ class SpatialDescriptor:
         finally:
             oriented.close()
         try:
-            gray.thumbnail((self.max_side, self.max_side), Image.Resampling.LANCZOS)
+            if self.max_side is not None:
+                gray.thumbnail((self.max_side, self.max_side), Image.Resampling.LANCZOS)
             with gray.filter(ImageFilter.GaussianBlur(self.blur_radius)) as smoothed:
                 pixels = np.asarray(smoothed, dtype=np.float32) / 255.0
         finally:

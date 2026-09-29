@@ -93,6 +93,18 @@ class RetrievalTests(unittest.TestCase):
         self.assertEqual(resumed["reused_candidates"], 1)
         self.assertEqual(resumed["processed_candidates"], 2)
 
+    def test_resolution_change_requires_rebuild_and_legacy_index_still_loads(self):
+        self.build(descriptor=SpatialDescriptor(max_side=256))
+        _, _, legacy, _ = load_index(self.index, search_device="cpu")
+        self.assertEqual(legacy.max_side, 256)
+        with self.assertRaisesRegex(ValueError, "changed"):
+            self.build()
+        rebuilt = self.build(rebuild=True)
+        self.assertEqual(rebuilt["reused_candidates"], 0)
+        _, _, native, _ = load_index(self.index, search_device="cpu")
+        self.assertIsNone(native.max_side)
+        self.assertEqual(native.metadata()["version"], "spatial-gray-edge-v2-native")
+
     def test_changes_require_explicit_rebuild(self):
         self.build()
         with self.assertRaisesRegex(ValueError, "changed"):

@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -61,8 +62,30 @@ class DescriptorTests(unittest.TestCase):
         rotated.getexif()[274] = 6
         np.testing.assert_allclose(descriptor.extract(image), descriptor.extract(rotated), atol=1e-6)
 
+    def test_native_default_uses_full_pixel_grid(self):
+        image = self.scene(size=(640, 480), x=300)
+        before = image.tobytes()
+        descriptor = SpatialDescriptor()
+        with patch("image_extraction.descriptors.np.gradient", wraps=np.gradient) as gradient:
+            vector = descriptor.extract(image)
+        self.assertEqual([call.args[0].shape for call in gradient.call_args_list], [(480, 640)] * 2)
+        self.assertEqual(vector.shape, (576,))
+        self.assertAlmostEqual(float(np.linalg.norm(vector)), 1, places=6)
+        self.assertEqual(image.tobytes(), before)
+        self.assertIsNone(descriptor.metadata()["parameters"]["max_side"])
+        self.assertEqual(descriptor.metadata()["version"], "spatial-gray-edge-v2-native")
+
+    def test_explicit_resize_preserves_legacy_descriptor_metadata(self):
+        descriptor = SpatialDescriptor(max_side=256)
+        with patch("image_extraction.descriptors.np.gradient", wraps=np.gradient) as gradient:
+            descriptor.extract(self.scene(size=(640, 480), x=300))
+        self.assertEqual([call.args[0].shape for call in gradient.call_args_list], [(192, 256)] * 2)
+        self.assertEqual(descriptor.metadata()["version"], "spatial-gray-edge-v1")
+        self.assertEqual(descriptor.metadata()["preprocessing"],
+                         "EXIF orientation, grayscale, aspect-preserving thumbnail, Gaussian blur; no padding")
+
     def test_invalid_configuration(self):
-        for kwargs in ({"grid_size": 0}, {"max_side": 0}, {"orientation_bins": 1.5},
+        for kwargs in ({"grid_size": 0}, {"max_side": 0}, {"max_side": -1}, {"max_side": 1.5}, {"orientation_bins": 1.5},
                        {"blur_radius": -1}, {"blur_radius": float("nan")},
                        {"intensity_weight": 1.1}, {"intensity_weight": float("nan")}):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):

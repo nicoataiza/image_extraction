@@ -7,7 +7,7 @@ produces an HTML report showing each frame alongside its ranked matches.
 The current baseline compares grayscale layout and edge directions using
 576-dimensional descriptors and FAISS exact search. CUDA vector indexing and
 search are verified on the RTX 5060; image decoding and descriptor extraction run
-on CPU. Similarity scores are ranking signals, not confidence percentages, and
+on CPU at native image resolution. Similarity scores are ranking signals, not confidence percentages, and
 retrieval quality on real images still needs labelled evaluation.
 
 ## Setup
@@ -50,12 +50,19 @@ python -m image_extraction query \
 ```
 
 Open `outputs/my-video/report.html` in a browser; `results.json` contains scores,
-source paths, timestamps, and timings. Use a fresh output directory for each query.
+source paths, timestamps, and timings. Exported query frames retain the video’s
+native resolution; click a query image to open it at full size. New indexes also
+extract descriptors at native resolution, and queries use the index’s stored settings.
+Use a fresh output directory for each query.
 
 By default, queries use one midpoint frame per detected shot. The example adds a
 frame every 0.5 seconds within each shot. `--search-device cuda` requires GPU
 execution; `auto` allows CPU fallback. Interrupted indexing resumes with the same
-command; changing the image collection requires `--rebuild` or a new index path.
+command; changing the image collection or descriptor resolution requires `--rebuild`
+or a new index path. Native extraction uses more CPU time and memory. Existing
+256-pixel indexes remain readable; new indexes use native resolution by default.
+Use `index --descriptor-max-side 256` to reproduce the old resized mode.
+The synthetic evaluator keeps its published 256-pixel baseline settings.
 
 ## Project files
 

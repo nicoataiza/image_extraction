@@ -22,6 +22,11 @@ def save_thumbnail(image, path, max_side=320):
         thumbnail.save(path, "JPEG", quality=85)
 
 
+def save_query_frame(image, path):
+    """Export a decoded video frame at its native resolution."""
+    image.save(path, "JPEG", quality=95)
+
+
 def query_video(video, index, output, *, top_k=10, search_device="auto", batch_size=16,
                 interval_seconds=None, threshold=27.0, min_scene_frames=15) -> dict:
     if top_k <= 0 or top_k > 2048 or batch_size <= 0:
@@ -118,10 +123,11 @@ def query_video(video, index, output, *, top_k=10, search_device="auto", batch_s
                 timing["query_encoding"] += time.perf_counter() - tick
                 tick = time.perf_counter()
                 thumbnail = f"queries/frame-{number:08d}.jpg"
-                save_thumbnail(image, output / thumbnail)
+                save_query_frame(image, output / thumbnail)
                 timing["thumbnails"] += time.perf_counter() - tick
             query = {"frame_number": number, "timestamp_seconds": timestamps[number],
-                     "thumbnail": thumbnail, "zero_vector": bool(not np.any(vector))}
+                     "thumbnail": thumbnail, "width": pixels.shape[1], "height": pixels.shape[0],
+                     "zero_vector": bool(not np.any(vector))}
             shot["queries"].append(query)
             batch.append((vector, query))
             if len(batch) >= batch_size:
@@ -140,6 +146,7 @@ def query_video(video, index, output, *, top_k=10, search_device="auto", batch_s
                "search": backend.metadata(), "top_k": top_k, "batch_size": batch_size,
                "interval_seconds": interval_seconds, "query_count": len(selected), "shot_count": len(shots),
                "shots": shots, "thumbnail_errors": thumbnail_errors,
+               "query_frame_export": {"resolution": "native", "format": "JPEG", "quality": 95},
                "timings_seconds": timing, "search_batches": search_batches,
                "python_version": platform.python_version(), "numpy_version": np.__version__,
                "created_at": datetime.now(timezone.utc).isoformat()}
@@ -177,7 +184,8 @@ figcaption{{overflow-wrap:anywhere;margin-top:8px;font-size:13px}}.missing{{heig
         for shot in results["shots"]:
             stream.write(f"<section><h2>Shot {shot['id']} · {shot['start_seconds']:.3f}–{shot['end_seconds']:.3f} s</h2>")
             for query in shot["queries"]:
-                stream.write(f"<div class=row><figure class=query><img src=\"{query['thumbnail']}\" alt=\"Query frame\"><figcaption>Query · {query['timestamp_seconds']:.3f} s<br>Frame {query['frame_number']}</figcaption>")
+                frame_link = escape(query["thumbnail"], quote=True)
+                stream.write(f"<div class=row><figure class=query><a href=\"{frame_link}\"><img loading=lazy src=\"{frame_link}\" alt=\"Query frame\"></a><figcaption>Query · {query['timestamp_seconds']:.3f} s<br>Frame {query['frame_number']} · <a href=\"{frame_link}\">Open frame</a></figcaption>")
                 if query["zero_vector"]:
                     stream.write("<p>No layout evidence: uniform frame.</p>")
                 stream.write("</figure>")

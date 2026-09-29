@@ -97,7 +97,8 @@ def evaluate_synthetic(
     if split not in ("dev", "test", "all"):
         raise ValueError("split must be dev, test, or all")
     root, output = Path(dataset).resolve(), Path(output).resolve()
-    descriptor = descriptor or SpatialDescriptor()
+    # Preserve the published synthetic baseline independently of indexing defaults.
+    descriptor = descriptor or SpatialDescriptor(max_side=256)
     manifest, records, pairs = _load_labels(root)
     output.mkdir(parents=True, exist_ok=True)
     results = {
