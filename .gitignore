@@ -1,6 +1,8 @@
 # Local datasets, input videos, and generated fixtures
 /data/
-/test_video.mp4
+/*.mp4
+/videos/
+/*.xlsx
 
 # Descriptors, indexes, reports, and project-local model/dataset caches
 /artifacts/
@@ -17,3 +19,10 @@ __pycache__/
 *.egg-info/
 /build/
 /dist/
+
+# Credentials, coverage, notebooks, and editor/OS files
+.env
+.coverage
+.ipynb_checkpoints/
+.vscode/
+.DS_Store
