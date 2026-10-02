@@ -147,6 +147,15 @@ def main(argv: list[str] | None = None) -> int:
     replay = commands.add_parser("replay-selection", help="Reproduce automatic selections from saved scores; no model inference")
     replay.add_argument("--selection", type=Path, required=True)
     replay.add_argument("--output", type=Path, required=True)
+    label = commands.add_parser("semantic-label", help="Suggest visible views and parts from a semantic index")
+    label.add_argument("--index", type=Path, required=True)
+    label.add_argument("--part-types", type=Path, required=True, help="CSV defining part_type_code and part_type_name")
+    label.add_argument("--output", type=Path, required=True, help="Fresh report directory outside the image collection")
+    label.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto", help="Text encoder device")
+    label.add_argument("--model-cache", type=Path)
+    label.add_argument("--batch-size", type=positive_int, default=2048, help="Frozen image vectors scored per CPU batch")
+    label.add_argument("--min-score", type=float, default=0.1, help="Uncalibrated view cosine review cutoff")
+    label.add_argument("--min-margin", type=float, default=0.01, help="Uncalibrated view runner-up margin cutoff")
     args = parser.parse_args(argv)
     try:
         if args.command == "download":
@@ -191,6 +200,13 @@ def main(argv: list[str] | None = None) -> int:
                 min_relevance=args.min_relevance, selection_mode=args.selection_mode,
                 duplicate_similarity=args.duplicate_similarity, temporal_similarity=args.temporal_similarity,
                 temporal_gap_seconds=args.temporal_gap_seconds), indent=2))
+        elif args.command == "semantic-label":
+            from .labelling import label_index
+
+            print(json.dumps(label_index(
+                args.index, args.part_types, args.output, device=args.device,
+                model_cache=args.model_cache, batch_size=args.batch_size,
+                min_score=args.min_score, min_margin=args.min_margin), indent=2))
         elif args.command == "query":
             from .query import query_video
 
