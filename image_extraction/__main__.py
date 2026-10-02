@@ -158,6 +158,14 @@ def main(argv: list[str] | None = None) -> int:
     label.add_argument("--batch-size", type=positive_int, default=2048, help="Frozen image vectors scored per CPU batch")
     label.add_argument("--min-score", type=float, default=0.1, help="Uncalibrated view cosine review cutoff")
     label.add_argument("--min-margin", type=float, default=0.01, help="Uncalibrated view runner-up margin cutoff")
+    required = commands.add_parser("index-requirements",
+                                   help="Mine reference photos for vehicle_angles.md categories from a semantic index")
+    required.add_argument("--index", type=Path, required=True)
+    required.add_argument("--spec", type=Path, default=Path("vehicle_angles.md"))
+    required.add_argument("--output", type=Path, required=True, help="Fresh directory outside the index and collection")
+    required.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto", help="Text encoder device")
+    required.add_argument("--model-cache", type=Path)
+    required.add_argument("--per-category", type=positive_int, default=1000, help="Maximum references kept per category")
     args = parser.parse_args(argv)
     try:
         if args.command == "download":
@@ -210,6 +218,12 @@ def main(argv: list[str] | None = None) -> int:
                 args.index, args.part_types, args.output, device=args.device,
                 model_cache=args.model_cache, batch_size=args.batch_size,
                 min_score=args.min_score, min_margin=args.min_margin), indent=2))
+        elif args.command == "index-requirements":
+            from .requirements import build_requirement_index
+
+            print(json.dumps(build_requirement_index(
+                args.index, args.spec, args.output, device=args.device, model_cache=args.model_cache,
+                per_category=args.per_category), indent=2))
         elif args.command == "query":
             from .query import query_video
 
