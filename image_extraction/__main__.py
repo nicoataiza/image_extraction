@@ -105,12 +105,14 @@ def main(argv: list[str] | None = None) -> int:
     index.add_argument("--index", type=Path, default=Path("artifacts/car-images"))
     index.add_argument("--search-device", choices=("auto", "cpu", "cuda"), default="auto")
     index.add_argument("--batch-size", type=positive_int, default=64, help="FAISS add batch size")
-    index.add_argument("--descriptor", choices=("spatial", "semantic"), default="spatial")
+    index.add_argument("--descriptor", choices=("spatial", "semantic", "fgclip2"), default="spatial",
+                       help="semantic = SigLIP 2; fgclip2 = FG-CLIP 2 base (vendored code)")
     index.add_argument("--extraction-device", choices=("auto", "cpu", "cuda"), default="auto")
     index.add_argument("--extraction-batch-size", type=positive_int, default=16,
                        help="Maximum decoded images per semantic inference batch")
     index.add_argument("--model-cache", type=Path, help="Semantic model cache (default: project .cache/models)")
-    index.add_argument("--semantic-max-patches", type=int, choices=(256, 512, 1024), default=256)
+    index.add_argument("--semantic-max-patches", type=int, choices=(256, 512, 576, 1024), default=256,
+                       help="SigLIP 2: 256/512/1024; FG-CLIP 2: 256/576/1024")
     index.add_argument("--descriptor-max-side", type=positive_int,
                        help="Optionally downsize descriptor input; default retains native resolution")
     index.add_argument("--rebuild", action="store_true", help="Recompute checkpoints and replace this index's generated artifacts")
@@ -173,12 +175,13 @@ def main(argv: list[str] | None = None) -> int:
             from .indexing import build_index
             from .descriptors import SpatialDescriptor
 
-            if args.descriptor == "semantic":
+            if args.descriptor in ("semantic", "fgclip2"):
                 if args.descriptor_max_side is not None:
                     raise ValueError("--descriptor-max-side applies only to spatial descriptors")
-                from .semantic import SemanticDescriptor
-                descriptor = SemanticDescriptor(device=args.extraction_device, cache_dir=args.model_cache,
-                                                max_num_patches=args.semantic_max_patches)
+                from .semantic import FgClip2Descriptor, SemanticDescriptor
+                encoder = FgClip2Descriptor if args.descriptor == "fgclip2" else SemanticDescriptor
+                descriptor = encoder(device=args.extraction_device, cache_dir=args.model_cache,
+                                     max_num_patches=args.semantic_max_patches)
             else:
                 if args.extraction_device == "cuda":
                     raise ValueError("Spatial extraction runs on CPU; use --descriptor semantic for CUDA extraction")

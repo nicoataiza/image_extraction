@@ -13,7 +13,7 @@ from PIL import Image
 
 from image_extraction.descriptors import SpatialDescriptor
 from image_extraction.indexing import build_index, load_index
-from image_extraction.semantic import SemanticDescriptor
+from image_extraction.semantic import FGCLIP2_VERSION, FgClip2Descriptor, SemanticDescriptor
 
 
 class BatchedDescriptor(SpatialDescriptor):
@@ -117,6 +117,32 @@ class BatchedIndexTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "incompatible"):
             load_index(self.index, search_device="cpu")
 
+    def test_fgclip2_index_roundtrip_is_versioned_separately(self):
+        def features(descriptor, images):
+            result = np.zeros((len(images), descriptor.dimension), dtype=np.float32)
+            result[:, 1] = 1
+            return result
+
+        with patch.object(FgClip2Descriptor, "extract_batch", features):
+            self.build(FgClip2Descriptor(device="cpu"))
+        with patch.object(FgClip2Descriptor, "_load", side_effect=AssertionError("model loaded")):
+            manifest, _, loaded, backend = load_index(self.index, search_device="cpu", extraction_device="cpu")
+        self.assertIs(type(loaded), FgClip2Descriptor)
+        self.assertEqual(manifest["descriptor"]["version"], FGCLIP2_VERSION)
+        self.assertEqual(set(manifest["descriptor"]["vendored_code_sha256"]),
+                         {"configuration_fgclip2.py", "modeling_fgclip2.py"})
+        self.assertEqual(backend.index.d, 768)
+        # A SigLIP 2 descriptor must never silently reuse FG-CLIP 2 checkpoints.
+        with self.assertRaisesRegex(ValueError, "changed"):
+            self.build(SemanticDescriptor(device="cpu"))
+        # SigLIP-specific zero-shot labelling refuses FG-CLIP 2 vectors.
+        from image_extraction.labelling import label_index
+        with tempfile.TemporaryDirectory() as temp:
+            parts = Path(temp) / "parts.csv"
+            parts.write_text("part_type_code,part_type_name\nA,DOOR\nB,WHEEL\nC,MIRROR\n")
+            with self.assertRaisesRegex(ValueError, "SigLIP 2"):
+                label_index(self.index, parts, Path(temp) / "labels")
+
     @unittest.skipUnless(find_spec("torch") and find_spec("transformers") and find_spec("cv2")
                          and find_spec("scenedetect"), "Optional query dependencies missing")
     def test_semantic_video_queries_batch_images_and_label_report(self):
@@ -179,6 +205,22 @@ class SemanticEncoderTests(unittest.TestCase):
         np.testing.assert_allclose(np.linalg.norm(vectors, axis=1), 1, atol=1e-5)
         np.testing.assert_allclose(vectors[0], alone, atol=1e-5)
         self.assertEqual(descriptor.extract_batch([]).shape, (0, 16))
+
+    def test_fgclip2_rejects_unpinned_revision_and_unsupported_patches(self):
+        for kwargs in ({"revision": "main"}, {"max_num_patches": 512}):
+            with self.assertRaises(ValueError):
+                FgClip2Descriptor(**kwargs)
+        self.assertEqual(FgClip2Descriptor(max_num_patches=576).metadata()["parameters"]["max_num_patches"], 576)
+
+    @unittest.skipUnless(find_spec("torch") and find_spec("transformers") and any(
+        (Path(__file__).resolve().parents[1] / ".cache/models").glob("models--qihoo360--fg-clip2-base/snapshots/*/model.safetensors")),
+        "FG-CLIP 2 weights not cached locally")
+    def test_fgclip2_real_weights_load_exactly_and_text_is_distinct(self):
+        # Transformers 5 + vendored init once re-randomized weights silently; _load now verifies.
+        descriptor = FgClip2Descriptor(device="cpu")
+        vectors, runtime = descriptor.encode_text(["a photo of a car headlight.", "a photo of a car dashboard."])
+        self.assertEqual(runtime["device"], "cpu")
+        self.assertLess(float(vectors[0] @ vectors[1]), 0.97)
 
     def test_cuda_failure_is_clear_before_download(self):
         import torch

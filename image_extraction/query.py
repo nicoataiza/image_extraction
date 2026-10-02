@@ -228,7 +228,7 @@ def query_video(video, index, output, *, top_k=10, search_device="auto", batch_s
 
 
 def render_report(results, path):
-    semantic = results["index"]["descriptor"]["version"].startswith("siglip2-")
+    semantic = results["index"]["descriptor"]["version"].startswith(("siglip2-", "fgclip2-"))
     title = f"{'Semantic' if semantic else 'Composition'} matches · {Path(results['video']['path']).name}"
     description = ("Semantic image similarity (SigLIP 2). Scores do not measure composition quality or prove part presence."
                    if semantic else "Spatial grayscale/edge baseline.")

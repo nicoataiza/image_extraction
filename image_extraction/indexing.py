@@ -168,10 +168,12 @@ def _load_index(destination, search_device, extraction_device="auto", model_cach
     if manifest.get("schema_version") != INDEX_SCHEMA or manifest.get("status") != "complete":
         raise ValueError("Index is incompatible or incomplete; build/resume it before querying")
     try:
-        from .semantic import SEMANTIC_VERSION, SemanticDescriptor
+        from .semantic import FGCLIP2_VERSION, SEMANTIC_VERSION, FgClip2Descriptor, SemanticDescriptor
         settings = manifest["descriptor"]
         if settings.get("version") == SEMANTIC_VERSION:
             descriptor = SemanticDescriptor(**settings["parameters"], device=extraction_device, cache_dir=model_cache)
+        elif settings.get("version") == FGCLIP2_VERSION:
+            descriptor = FgClip2Descriptor(**settings["parameters"], device=extraction_device, cache_dir=model_cache)
         else:
             descriptor = SpatialDescriptor(**settings["parameters"])
         if descriptor.metadata() != manifest["descriptor"]:

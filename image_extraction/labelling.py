@@ -266,7 +266,7 @@ def label_index(index, part_types, output, *, device="auto", model_cache=None,
         raise ValueError("Use a fresh, empty annotation output directory")
     labels, skipped = make_taxonomy(part_types)
     manifest, images, descriptor, backend = load_index(index, search_device="cpu")
-    if not isinstance(descriptor, SemanticDescriptor):
+    if type(descriptor) is not SemanticDescriptor:
         raise ValueError("Semantic labelling requires a pinned SigLIP 2 semantic index")
     root = Path(manifest["images_root"])
     ensure_separate(root, output)

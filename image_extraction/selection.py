@@ -170,7 +170,7 @@ def select_video_frames(results, output, *, top_k=None, extraction_device="auto"
     ensure_separate(source.parent, output)
     input_sha256 = file_hash(source)
     data = json.loads(source.read_text())
-    if data.get("status") != "complete" or not data["index"]["descriptor"]["version"].startswith("siglip2-"):
+    if data.get("status") != "complete" or not data["index"]["descriptor"]["version"].startswith(("siglip2-", "fgclip2-")):
         raise ValueError("Selection requires a completed semantic query report")
     queries = [dict(query, shot_id=shot["id"]) for shot in data["shots"] for query in shot["queries"]]
     queries.sort(key=lambda query: query["frame_number"])
