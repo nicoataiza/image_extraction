@@ -64,6 +64,96 @@ or a new index path. Native extraction uses more CPU time and memory. Existing
 Use `index --descriptor-max-side 256` to reproduce the old resized mode.
 The synthetic evaluator keeps its published 256-pixel baseline settings.
 
+### Reduced sampling and best-view selection (October 2 revision)
+
+The three-alternative neighborhood experiment produced too many similar
+candidates. Use `best-local` to keep only the highest stability score (quality
+minus motion penalty) in each window. A one-second interval with ±0.5-second
+windows inspects nearby decoded frames while passing far fewer images to SigLIP:
+
+```bash
+OMP_NUM_THREADS=4 .venv/bin/python -m image_extraction query \
+  --video videos/NEW_VIDEO.mp4 --index artifacts/wcp-all-semantic \
+  --output outputs/NEW_VIDEO/best-local \
+  --interval-seconds 1 --sampling-mode best-local --neighborhood-seconds 0.5 \
+  --extraction-device cuda --search-device cuda
+
+OMP_NUM_THREADS=4 .venv/bin/python -m image_extraction select-frames \
+  --results outputs/NEW_VIDEO/best-local/results.json \
+  --output outputs/NEW_VIDEO/best-view --selection-mode best-view \
+  --duplicate-similarity 0.85 --extraction-device cuda --search-device cuda
+```
+
+Query defaults remain uniform for compatibility; the new sampling mode is
+explicit. Final selection now defaults to best-view with no fixed output count.
+Component weights are unchanged. Best-view defaults to a stricter relevance floor
+of 0.85 (legacy: 0.65) because removing the count cap otherwise admits weak
+transition frames. Both cutoffs remain provisional heuristics, not calibrated probabilities. No hand-picked
+frames are used. `view_decisions.py` implements the new decisions separately from
+`selection_decisions.py`, preserving the old replay hash contract. Reports include
+each winner's suppressed alternatives and scores; replay verifies those groups.
+Without `--interval-seconds`, best-local still searches only shot midpoints.
+`local-best-frame-v1` identifies the one-winner sampler; `best-distinct-views-v1`
+identifies the new selection rule. Do not claim these heuristics recognize parts.
+
+The VA14022 revision produced **189 candidates → 24 photos**, compared with
+**833 → 17** for the earlier neighborhood experiment. There is no fixed target.
+See `outputs/VA14022/best-view-comparison/report.html` for all three output sets,
+and `outputs/VA14022/wcp-selected-best-view-v2/report.html` for each representative
+and its suppressed alternatives. Exact replay, checksums and ZIP checks passed.
+Zero selected pairs exceed cosine 0.85, versus six in the earlier neighborhood
+set; this numerical rule does not prove visual uniqueness or part coverage.
+Both new stages used CUDA. Thresholds were explored on VA14022 and still need
+independent evaluation. Front/side overviews and distinct physical parts are not
+reserved or guaranteed by the new score-first rule.
+
+### Neighborhood candidate sampling
+
+Use `--sampling-mode neighborhood` to search around the midpoint/interval anchors
+before semantic retrieval. Existing commands default to `uniform` sampling for
+baseline comparisons. For the active semantic index:
+
+```bash
+OMP_NUM_THREADS=4 .venv/bin/python -m image_extraction query \
+  --video videos/VA14022.mp4 --index artifacts/wcp-all-semantic \
+  --output outputs/VA14022/wcp-semantic-neighborhood \
+  --extraction-device cuda --search-device cuda \
+  --interval-seconds 0.5 --sampling-mode neighborhood --neighborhood-seconds 0.25
+```
+
+This inspects every frame within ±0.25 seconds of each anchor, clipped to its
+shot, and retains up to three distinct alternatives: a quality winner, a stability
+winner if different, and the best-quality frame at least 0.1 seconds from both.
+Overlapping windows share candidates by frame number. Very short shots still
+retain a candidate; the exact anchor need not survive. Omitting the interval still
+searches only around each shot midpoint, so use an interval for continuous pans.
+
+The existing scan collects grayscale Laplacian variance, usable exposure fraction,
+and adjacent-frame luminance change at a maximum side of 320 pixels. It retains
+scalar measurements and one preceding grayscale image, not the video's pixels.
+Log sharpness and motion are min/max normalized within each window (constant
+values map to 0.5). Quality is `0.8 * sharpness + 0.2 * exposure`; stability subtracts
+`0.2 * motion`. Both subtract 0.15 within 0.1 seconds of internal shot boundaries.
+Motion averages available neighbors within the same shot, never across a cut;
+missing motion is neutral. Six-decimal scores and lower frame numbers resolve
+ties. These new sampling heuristics do not change the final selection weights.
+
+Motion here includes lighting/subject changes; it is not camera velocity. The
+shortlist does not identify parts or establish object completeness, and it can
+still miss useful angles. Semantic adaptive sampling is not implemented. Candidate
+encoding and final selection may cost more because several alternatives replace
+each anchor; selection currently accepts at most 5,000 candidates.
+
+`sampling.json` records every window's competitors, raw measurements, scores and
+retention roles. `results.json` records its checksum and each candidate's originating
+anchors. The HTML report links the evidence. `select-frames` consumes these results
+normally, preserves the sampling evidence, and passes all retained alternatives to
+the existing reference/quality/diversity scorer. Replay preserves and verifies the
+evidence; it replays final selection, not video decoding or sampling measurements.
+Native-resolution JPEG export is unchanged. Use fresh output directories for each
+experiment and compare the photos visually before treating this as an improvement
+on real videos. Keep the VA14022 feedback profile scoped to VA14022.
+
 ## Project files
 
 - `image_extraction/`: ingestion, descriptors, indexing, video sampling, and retrieval.
@@ -165,13 +255,16 @@ are single-run observations, not a retrieval-quality evaluation.
 ## Select relevant, distinct video frames
 
 `select-frames` ranks an existing semantic query's sampled frames against the
-same reference index and exports up to 17 native-resolution photos by default:
+same reference index. The default `--selection-mode best-view` has no photo-count
+cap: it exports the best-scoring representative from each directly similar group.
+Use `--top-k` only for an explicit maximum; `--selection-mode legacy` preserves
+the earlier seeded diversity selection (default maximum 17). Example:
 
 ```bash
 .venv/bin/python -m image_extraction select-frames \
   --results outputs/VA14022/wcp-semantic/results.json \
   --output outputs/VA14022/selection-new \
-  --top-k 17 --extraction-device cuda --search-device cuda \
+  --extraction-device cuda --search-device cuda \
   --feedback-profile outputs/VA14022/feedback-profile.json
 ```
 
@@ -183,8 +276,8 @@ The selector re-encodes candidate frames with the saved SigLIP settings and
 retrieves 64 reference neighbors. It keeps up to three distinct reference
 embeddings, collapsing similarities of at least 0.9995 so duplicate photos under
 different stock folders do not inflate reference support. Relevance is the mean
-cosine similarity of these distinct matches. The default `--min-relevance 0.65`
-is an uncalibrated, adjustable cutoff, not a probability or proof of part absence.
+cosine similarity of these distinct matches. The relevance floor defaults to 0.85 in best-view mode and 0.65 in legacy mode;
+`--min-relevance` overrides it. This is an uncalibrated, adjustable cutoff, not a probability or proof of part absence.
 
 Ranking combines reference relevance (35%), thumbnail sharpness/exposure proxies
 (20%), spatial layout similarity to the reference photos (20%), and optional
@@ -195,11 +288,19 @@ Only candidates within 0.05 of an exemplar's strongest similarity, and at least
 while developing on VA14022, not independently validated thresholds. An unlabeled
 reference photo's layout is not assumed to be a good composition.
 
-After reserving matching feedback examples where available, greedy selection
-penalizes similarity to already-selected frames (weight 0.5) and suppresses
-similarity of at least 0.93. This encourages different views but can confuse
-similar-looking separate parts. It returns fewer than K if no qualifying distinct
-candidates remain. The workbook, collection and video are never modified.
+Best-view first groups consecutive eligible samples within each shot. Every pair
+in a group must have cosine >=0.80, and consecutive timestamps must be at most
+2 seconds apart (`--temporal-similarity`, `--temporal-gap-seconds`). Ineligible
+frames break groups. Each group contributes its highest weighted score. Selection
+then takes the best remaining representative and suppresses representatives with cosine at least
+`--duplicate-similarity` (default 0.85) to that winner. It continues until all
+eligible candidates are represented, or an explicit `--top-k` cap is reached.
+Feedback affects the score but never reserves slots or bypasses duplicate checks.
+There is no diversity penalty. Temporal groups require pairwise similarity; global suppression compares their
+representatives. This prevents unconstrained transitive chains through a pan.
+These are similarity groups, not detected object instances: opposite-side mirrors
+or different close-ups can still be confused. Lower thresholds suppress more
+views and can lose useful differences.
 
 A feedback profile explicitly maps workbook media to visual preferences; document
 text is not interpreted as executable instructions. For example:
@@ -252,8 +353,9 @@ The rear views use angles with better bumper margins. The chosen engine detail
 still does not satisfy the workbook's wider-bay preference; a wider capture is
 needed. Visual review remains part of this result, not an automated quality claim.
 
-### Automatic, auditable selection and exact replay
+### Legacy automatic selection and exact replay
 
+The following describes the historical `--selection-mode legacy` behavior.
 Use the automatic path **without `--review`** when the final selection must come
 entirely from code. The current automatic VA14022 report is
 `outputs/VA14022/wcp-selected-repeatable/report.html`. It is a different result
@@ -263,7 +365,7 @@ from the older assistant-reviewed `wcp-selected/` output.
 OMP_NUM_THREADS=4 .venv/bin/python -m image_extraction select-frames \
   --results outputs/VA14022/wcp-semantic/results.json \
   --output outputs/VA14022/automatic-new \
-  --top-k 17 --extraction-device cuda --search-device cuda \
+  --selection-mode legacy --top-k 17 --extraction-device cuda --search-device cuda \
   --feedback-profile outputs/VA14022/feedback-profile.json
 ```
 
@@ -316,3 +418,96 @@ Local verification: two independent VA14022 automatic runs produced identical
 17-frame selections and all 4,508 recorded comparisons; the frozen replay matched
 as well. Evidence is in `outputs/VA14022/selection-repeatability.json`. All 70 tests
 passed, including CUDA-required checks and offline replay/tamper tests.
+
+### Semantic image labelling
+
+Stock CSV part types describe the requested stock item. The WCP downloader saves
+`VehicleImages`, so assigning that stock's part type to every photograph does not
+establish what each photo shows. `labels.csv` is stock metadata only.
+
+Generate image-content suggestions by comparing the existing pinned SigLIP 2
+image vectors with text descriptions. The stock CSV supplies the vocabulary of
+part names; stock-to-part associations do not participate in scoring.
+
+```bash
+OMP_NUM_THREADS=4 .venv/bin/python -m image_extraction semantic-label \
+  --index artifacts/wcp-all-semantic \
+  --part-types to_download_stock_numbers.csv \
+  --output outputs/wcp-semantic-labels --device cuda
+```
+
+Use a fresh output directory for each run. Reports must remain outside the image
+collection because their thumbnails would otherwise become dataset inputs. The
+command verifies the index checksums and source paths/sizes/mtimes, then reuses
+stored vectors without repeating image inference. It loads the text tower and
+tokenizer of the same pinned model; the first run may download tokenizer assets.
+`--device auto|cpu|cuda` selects text encoding; batched cosine scoring uses CPU.
+Explicit CUDA requests fail if execution is unavailable; auto records fallback.
+
+Outputs include:
+
+- `semantic-labels.csv`: relative image paths, source folder stock numbers,
+  proposed broad view labels, top three view/part candidates, cosine scores,
+  runner-up margins, review priority and blank manual-review fields.
+- `report.html`: thumbnails of up to three strongest and three ambiguous matches
+  per winning view category, suppressing repeated filenames within a category.
+- `taxonomy.json`, `prompt-embeddings.npy`, `label-scores.npy`,
+  `image-paths.jsonl`, `summary.json`, and `status.json`: frozen vocabulary,
+  scoring inputs/results, row mapping, provenance, checksums and completion state.
+
+Prompts are lowercase and padded to 64 tokens, following the
+[SigLIP 2 model documentation](https://huggingface.co/docs/transformers/model_doc/siglip2).
+Each label score is the mean cosine across its two text prompts. View and part
+candidates are ranked separately, with six-decimal scores and taxonomy order for
+ties. `semantic_label` is `uncertain` when the best view cosine is below
+`--min-score` (default 0.1), its runner-up margin is below `--min-margin` (default
+0.01), or the `other_unclear` category wins. These cutoffs are provisional review
+heuristics, not calibrated confidence. Even other labels remain `unreviewed`.
+
+Part candidates are suggestions only: whole-car images can show multiple parts;
+left/right distinctions, hidden parts and exact stock identities are not verified.
+The method does not detect part bounding boxes, infer car/part numbers, establish
+absence, or validate fine part labels. Independent human review is required before
+using predictions as training ground truth or claiming annotation accuracy.
+
+## Required photos per vehicle part (`vehicle_angles.md`)
+
+`vehicle_angles.md` lists the photo categories wanted from each video (exterior
+angles, lights, wheels, VIN plates, engine bay parts, interior controls, ...), with
+photo counts from their sides/views and optional `framing:`/`avoid:` composition rules.
+The collection is unlabeled, so `index-requirements` uses the index's own text encoder
+to mine reference photos per category. It splits each category's references into best-
+and worst-framed groups by its framing rule. This takes seconds and re-encodes nothing.
+
+The tested encoder for this is [FG-CLIP 2 base](https://huggingface.co/qihoo360/fg-clip2-base)
+(Apache-2.0, revision `430fbc8`), a fine-grained SigLIP 2-style model. Its reviewed model
+code is vendored in `image_extraction/vendor/fgclip2/`, so remote code stays disabled.
+
+```bash
+OMP_NUM_THREADS=4 .venv/bin/python -m image_extraction index \
+  --images data/wcp-all-downloaded --index artifacts/wcp-all-fgclip2 \
+  --descriptor fgclip2 --extraction-device cuda --search-device cuda --extraction-batch-size 32
+OMP_NUM_THREADS=4 .venv/bin/python -m image_extraction index-requirements \
+  --index artifacts/wcp-all-fgclip2 --spec vehicle_angles.md \
+  --output artifacts/wcp-all-fgclip2-requirements-v2 --device cuda
+OMP_NUM_THREADS=4 .venv/bin/python -m image_extraction query \
+  --video videos/NEW_VIDEO.mp4 --index artifacts/wcp-all-fgclip2 \
+  --output outputs/NEW_VIDEO/fgclip2-semantic-best-local --extraction-device cuda --search-device cuda \
+  --interval-seconds 1 --sampling-mode best-local --neighborhood-seconds 0.5 --top-k 10
+OMP_NUM_THREADS=4 .venv/bin/python -m image_extraction select-frames \
+  --results outputs/NEW_VIDEO/fgclip2-semantic-best-local/results.json \
+  --output outputs/NEW_VIDEO/fgclip2-selected-required \
+  --selection-mode required-views --requirements artifacts/wcp-all-fgclip2-requirements-v2 \
+  --extraction-device cuda --search-device cuda
+```
+
+`required-views` puts each frame in its single best-matching category (or none).
+Within a category it ranks frames by 0.40 part match, 0.35 framing and 0.25
+sharpness/exposure. Extra photos (other angles or sides) must be at least 3 s apart,
+not near-duplicates, and reasonably strong. The report lists every category as found,
+possible (reported, not exported) or not found, and flags close calls with "check".
+Exports are named by category, and `replay-selection` reproduces the decisions offline.
+"Not found" does not prove a part is absent; left/right sides, object completeness and
+plate readability are not verified. See [AGENTS.md](AGENTS.md) for thresholds, evidence
+and current results.
+
