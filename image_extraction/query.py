@@ -13,6 +13,7 @@ from PIL import Image, ImageOps
 
 from .download import write_json
 from .indexing import ensure_separate, file_hash, load_index
+from .sampling import SAMPLING_VERSION, BEST_LOCAL_VERSION, shortlist_neighbors
 from .video import detect_shots, read_selected_frames, select_frames
 
 
@@ -29,11 +30,16 @@ def save_query_frame(image, path):
 
 def query_video(video, index, output, *, top_k=10, search_device="auto", batch_size=16,
                 interval_seconds=None, threshold=27.0, min_scene_frames=15,
-                extraction_device="auto", model_cache=None) -> dict:
+                extraction_device="auto", model_cache=None, sampling_mode="uniform",
+                neighborhood_seconds=0.25) -> dict:
     if top_k <= 0 or top_k > 2048 or batch_size <= 0:
         raise ValueError("top_k must be 1..2048 and batch_size must be positive")
     if interval_seconds is not None and (not math.isfinite(interval_seconds) or interval_seconds <= 0):
         raise ValueError("interval_seconds must be positive and finite")
+    if sampling_mode not in ("uniform", "neighborhood", "best-local"):
+        raise ValueError("sampling_mode must be uniform, neighborhood or best-local")
+    if not math.isfinite(neighborhood_seconds) or neighborhood_seconds <= 0:
+        raise ValueError("neighborhood_seconds must be positive and finite")
     video = Path(video).expanduser().resolve()
     index = Path(index).expanduser().resolve()
     output = Path(output).expanduser().resolve()
@@ -52,18 +58,56 @@ def query_video(video, index, output, *, top_k=10, search_device="auto", batch_s
     ensure_separate(source_root, output)
     video_stat = video.stat()
     print(f"Detecting shots in {video.name}", file=sys.stderr)
-    video_info, shots, timestamps = detect_shots(video, threshold=threshold, min_scene_frames=min_scene_frames)
+    video_info, shots, timestamps = detect_shots(
+        video, threshold=threshold, min_scene_frames=min_scene_frames,
+        collect_sampling_metrics=sampling_mode != "uniform")
+    metrics = video_info.pop("sampling_metrics", None)
     selected = []
+    sampling_evidence, windows, anchor_count = {}, [], 0
+    tick = time.perf_counter()
     for shot in shots:
         shot["queries"] = []
-        selected.extend((number, shot) for number in select_frames(shot, timestamps, interval_seconds))
+        anchors = select_frames(shot, timestamps, interval_seconds)
+        anchor_count += len(anchors)
+        if sampling_mode != "uniform":
+            retained, comparisons = shortlist_neighbors(
+                shot, timestamps, metrics, anchors, radius_seconds=neighborhood_seconds, single_winner=sampling_mode == "best-local")
+            sampling_evidence.update(retained)
+            windows.extend(comparisons)
+            selected.extend((number, shot) for number in retained)
+        else:
+            selected.extend((number, shot) for number in anchors)
+    sampling_seconds = time.perf_counter() - tick
+    sampling = {"mode": sampling_mode, "anchor_count": anchor_count, "candidate_count": len(selected)}
     output.mkdir(parents=True, exist_ok=True)
     (output / "queries").mkdir()
     (output / "candidates").mkdir()
     write_json(output / "status.json", {"status": "incomplete", "video": str(video), "index": str(index)})
+    if sampling_mode != "uniform":
+        version = BEST_LOCAL_VERSION if sampling_mode == "best-local" else SAMPLING_VERSION
+        audit = {"version": version,
+                 "settings": {"radius_seconds": neighborhood_seconds, "metric_max_side": 320,
+                              "quality": "0.8 * local sharpness + 0.2 * exposure - transition penalty",
+                              "stability": "quality - 0.2 * local motion",
+                              "normalization": "min/max within each window; sharpness uses log1p; constant range is 0.5",
+                              "motion": "mean adjacent-frame grayscale absolute difference / 255, within shot",
+                              "missing_motion": "neutral 0.5 after normalization",
+                              "transition_seconds": 0.1, "transition_penalty": 0.15,
+                              "alternative_separation_seconds": 0.1, "maximum_per_anchor": 1 if sampling_mode == "best-local" else 3,
+                              "tie_break": "six-decimal score, then lower frame number"},
+                 "windows": windows,
+                 "selected_frame_numbers": [number for number, _ in selected],
+                 "limitations": ["Motion includes lighting and subject changes; it is not camera velocity.",
+                                 "Sharpness and exposure do not establish object completeness or a good angle.",
+                                 "Shortlists can omit brief views; no semantic grouping is used."]}
+        write_json(output / "sampling.json", audit)
+        sampling.update(version=version, radius_seconds=neighborhood_seconds,
+                        evidence="sampling.json", evidence_sha256=file_hash(output / "sampling.json"))
+    del metrics, windows
     print(f"Detected {len(shots)} shots; retrieving {len(selected)} query frames", file=sys.stderr)
     timing = {"index_load_and_device_setup": load_seconds,
               "video_scan_and_shot_detection": video_info.pop("scan_seconds"),
+              "candidate_shortlisting": sampling_seconds,
               "selected_frame_decode": 0.0, "query_encoding": 0.0,
               "retrieval": 0.0, "thumbnails": 0.0}
     candidate_cache, thumbnail_errors, search_batches = {}, [], []
@@ -139,6 +183,8 @@ def query_video(video, index, output, *, top_k=10, search_device="auto", batch_s
             query = {"frame_number": number, "timestamp_seconds": timestamps[number],
                      "thumbnail": thumbnail, "width": pixels.shape[1], "height": pixels.shape[0],
                      "zero_vector": False if hasattr(descriptor, "extract_batch") else bool(not np.any(vector))}
+            if sampling_mode != "uniform":
+                query["sampling"] = sampling_evidence[number]
             shot["queries"].append(query)
             batch.append((vector, query))
             if len(batch) >= batch_size:
@@ -161,6 +207,7 @@ def query_video(video, index, output, *, top_k=10, search_device="auto", batch_s
                "extraction": descriptor.runtime_metadata() if hasattr(descriptor, "runtime_metadata") else {"device": "cpu"},
                "top_k": top_k, "batch_size": batch_size,
                "interval_seconds": interval_seconds, "query_count": len(selected), "shot_count": len(shots),
+               "sampling": sampling,
                "shots": shots, "thumbnail_errors": thumbnail_errors,
                "query_frame_export": {"resolution": "native", "format": "JPEG", "quality": 95},
                "timings_seconds": timing, "search_batches": search_batches,
@@ -198,6 +245,9 @@ figcaption{{overflow-wrap:anywhere;margin-top:8px;font-size:13px}}.missing{{heig
 <p>{description} Scores indicate ranking similarity, not probabilities. <a href="results.json">Download JSON results</a></p>""")
         if results["search"]["fallback_reason"]:
             stream.write(f"<p class=meta>CPU fallback: {escape(results['search']['fallback_reason'])}</p>")
+        if results.get("sampling", {}).get("mode") in ("neighborhood", "best-local"):
+            stream.write(f"<p>Local sampling ({escape(results['sampling']['mode'])}). "
+                         '<a href="sampling.json">Full sampling comparisons</a></p>')
         if results["thumbnail_errors"]:
             stream.write(f"<p>{len(results['thumbnail_errors'])} source thumbnails unavailable; see JSON for details.</p>")
         for shot in results["shots"]:
@@ -207,6 +257,10 @@ figcaption{{overflow-wrap:anywhere;margin-top:8px;font-size:13px}}.missing{{heig
                 stream.write(f"<div class=row><figure class=query><a href=\"{frame_link}\"><img loading=lazy src=\"{frame_link}\" alt=\"Query frame\"></a><figcaption>Query · {query['timestamp_seconds']:.3f} s<br>Frame {query['frame_number']} · <a href=\"{frame_link}\">Open frame</a></figcaption>")
                 if query["zero_vector"]:
                     stream.write("<p>No layout evidence: uniform frame.</p>")
+                if query.get("sampling"):
+                    reasons = [f"Anchor {item['anchor_frame']}: {', '.join(item['roles'])}"
+                               for item in query["sampling"]]
+                    stream.write(f"<p>{escape('; '.join(reasons))}</p>")
                 stream.write("</figure>")
                 for match in query["matches"]:
                     source_link = escape(Path(match["source_path"]).as_uri(), quote=True)

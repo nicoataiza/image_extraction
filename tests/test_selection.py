@@ -213,6 +213,34 @@ class SelectionExportTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "checksum mismatch"):
             replay_selection(self.output / "selection.json", self.root / "replayed")
 
+    def test_sampling_evidence_survives_selection_and_offline_replay(self):
+        evidence = self.query / "sampling.json"
+        evidence.write_text(json.dumps({"version": "fixture", "windows": []}))
+        data = json.loads(self.results.read_text())
+        data["sampling"] = {"mode": "neighborhood", "evidence": "sampling.json",
+                            "evidence_sha256": file_hash(evidence)}
+        data["shots"][0]["queries"][0]["sampling"] = [{"anchor_frame": 0, "roles": ["quality"]}]
+        self.results.write_text(json.dumps(data))
+        self.run_selection(top_k=2, min_relevance=0)
+        evidence.unlink()
+        target = self.root / "replayed"
+        replay_selection(self.output / "selection.json", target)
+        report = json.loads((target / "selection.json").read_text())
+        self.assertEqual(file_hash(target / "sampling.json"), data["sampling"]["evidence_sha256"])
+        self.assertEqual(report["candidates"][0]["sampling"], data["shots"][0]["queries"][0]["sampling"])
+        (self.output / "sampling.json").write_text("tampered")
+        with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+            replay_selection(self.output / "selection.json", self.root / "tampered-replay")
+
+    def test_changed_sampling_evidence_is_rejected_before_selection(self):
+        evidence = self.query / "sampling.json"
+        evidence.write_text("changed")
+        data = json.loads(self.results.read_text())
+        data["sampling"] = {"evidence": "sampling.json", "evidence_sha256": "old"}
+        self.results.write_text(json.dumps(data))
+        with self.assertRaisesRegex(ValueError, "Sampling evidence checksum mismatch"):
+            self.run_selection()
+
     def test_changed_reference_is_rejected(self):
         (self.collection / "0.png").write_bytes(b"modified")
         with self.assertRaisesRegex(ValueError, "changed"):

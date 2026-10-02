@@ -18,7 +18,7 @@ def require_video():
     return cv2, scenedetect
 
 
-def detect_shots(path, *, threshold=27.0, min_scene_frames=15):
+def detect_shots(path, *, threshold=27.0, min_scene_frames=15, collect_sampling_metrics=False):
     if not math.isfinite(threshold) or threshold <= 0 or min_scene_frames <= 0:
         raise ValueError("Shot threshold and minimum scene frames must be positive")
     path = Path(path).expanduser().resolve()
@@ -37,6 +37,7 @@ def detect_shots(path, *, threshold=27.0, min_scene_frames=15):
         cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 1)
         detector = scenedetect.ContentDetector(threshold=threshold, min_scene_len=min_scene_frames)
         cuts, timestamps = [], []
+        sampling_metrics, previous_gray = [], None
         dimensions = None
         while True:
             ok, frame = cap.read()
@@ -49,6 +50,11 @@ def detect_shots(path, *, threshold=27.0, min_scene_frames=15):
             factor = min(1.0, 320 / max(width, height))
             small = cv2.resize(frame, (max(1, round(width * factor)), max(1, round(height * factor))),
                                interpolation=cv2.INTER_AREA)
+            if collect_sampling_metrics:
+                from .sampling import measure_frame
+                gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+                sampling_metrics.append(measure_frame(gray, previous_gray))
+                previous_gray = gray
             cuts.extend(cut.frame_num for cut in detector.process_frame(
                 scenedetect.FrameTimecode(number, fps=fps), small))
             if (number + 1) % 500 == 0:
@@ -74,13 +80,16 @@ def detect_shots(path, *, threshold=27.0, min_scene_frames=15):
               "start_seconds": timestamps[start],
               "end_seconds": timestamps[end] if end < len(timestamps) else end_seconds}
              for number, (start, end) in enumerate(zip(boundaries, boundaries[1:]))]
-    return {"path": str(path), "fps": fps, "decoded_frames": len(timestamps),
+    info = {"path": str(path), "fps": fps, "decoded_frames": len(timestamps),
             "width": dimensions[0], "height": dimensions[1], "end_seconds": end_seconds,
             "timestamp_source": timestamp_source, "final_frame_duration_estimated": True,
             "scene_detector": {"name": "ContentDetector", "threshold": threshold,
                                "min_scene_frames": min_scene_frames, "max_side": 320},
             "versions": {"opencv": cv2.__version__, "scenedetect": scenedetect.__version__},
-            "scan_seconds": time.perf_counter() - started}, shots, timestamps
+            "scan_seconds": time.perf_counter() - started}
+    if collect_sampling_metrics:
+        info["sampling_metrics"] = sampling_metrics
+    return info, shots, timestamps
 
 
 def select_frames(shot: dict, timestamps: list[float], interval_seconds=None) -> list[int]:

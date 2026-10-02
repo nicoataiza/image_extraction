@@ -124,18 +124,26 @@ def main(argv: list[str] | None = None) -> int:
     query.add_argument("--top-k", type=positive_int, default=10)
     query.add_argument("--batch-size", type=positive_int, default=16)
     query.add_argument("--interval-seconds", type=positive_float, help="Add interval samples within shots, alongside each midpoint")
+    query.add_argument("--sampling-mode", choices=("uniform", "neighborhood", "best-local"), default="uniform",
+                       help="Keep timestamp samples, or shortlist quality/motion alternatives around them")
+    query.add_argument("--neighborhood-seconds", type=positive_float, default=0.25,
+                       help="Search radius on each side of each sample in neighborhood mode (default: 0.25)")
     query.add_argument("--threshold", type=positive_float, default=27.0, help="ContentDetector cut threshold")
     query.add_argument("--min-scene-frames", type=positive_int, default=15)
     select = commands.add_parser("select-frames", help="Rank semantic query frames and select distinct photos")
     select.add_argument("--results", type=Path, required=True, help="Completed semantic query results.json")
     select.add_argument("--output", type=Path, required=True)
-    select.add_argument("--top-k", type=positive_int, default=17)
+    select.add_argument("--top-k", type=positive_int, help="Optional maximum exported photos; best-view mode has no default cap")
+    select.add_argument("--selection-mode", choices=("best-view", "legacy"), default="best-view")
+    select.add_argument("--duplicate-similarity", type=float, default=0.85, help="Best-view suppression cosine (default: 0.85)")
+    select.add_argument("--temporal-similarity", type=float, default=0.80, help="Minimum pairwise cosine within a continuous view group")
+    select.add_argument("--temporal-gap-seconds", type=positive_float, default=2.0, help="Maximum gap within a continuous view group")
     select.add_argument("--batch-size", type=positive_int, default=16)
     select.add_argument("--extraction-device", choices=("auto", "cpu", "cuda"), default="auto")
     select.add_argument("--search-device", choices=("auto", "cpu", "cuda"), default="auto")
     select.add_argument("--feedback-profile", type=Path, help="Explicit JSON mapping of workbook visual examples")
     select.add_argument("--review", type=Path, help="Optional reviewed frame IDs/reasons bound to the input checksum")
-    select.add_argument("--min-relevance", type=float, default=0.65, help="Uncalibrated relevance cutoff; default 0.65")
+    select.add_argument("--min-relevance", type=float, help="Uncalibrated relevance cutoff; best-view defaults to 0.85, legacy to 0.65")
     replay = commands.add_parser("replay-selection", help="Reproduce automatic selections from saved scores; no model inference")
     replay.add_argument("--selection", type=Path, required=True)
     replay.add_argument("--output", type=Path, required=True)
@@ -180,7 +188,9 @@ def main(argv: list[str] | None = None) -> int:
                 args.results, args.output, top_k=args.top_k, batch_size=args.batch_size,
                 extraction_device=args.extraction_device, search_device=args.search_device,
                 feedback_profile=args.feedback_profile, review_path=args.review,
-                min_relevance=args.min_relevance), indent=2))
+                min_relevance=args.min_relevance, selection_mode=args.selection_mode,
+                duplicate_similarity=args.duplicate_similarity, temporal_similarity=args.temporal_similarity,
+                temporal_gap_seconds=args.temporal_gap_seconds), indent=2))
         elif args.command == "query":
             from .query import query_video
 
@@ -188,7 +198,9 @@ def main(argv: list[str] | None = None) -> int:
                                          search_device=args.search_device, batch_size=args.batch_size,
                                          extraction_device=args.extraction_device, model_cache=args.model_cache,
                                          interval_seconds=args.interval_seconds, threshold=args.threshold,
-                                         min_scene_frames=args.min_scene_frames), indent=2))
+                                         min_scene_frames=args.min_scene_frames,
+                                         sampling_mode=args.sampling_mode,
+                                         neighborhood_seconds=args.neighborhood_seconds), indent=2))
         else:
             summary = inspect_dataset(args.images, args.output)
             print(json.dumps(summary, indent=2))

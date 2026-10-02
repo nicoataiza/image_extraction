@@ -244,6 +244,40 @@ class RetrievalTests(unittest.TestCase):
         self.assertEqual(summary["thumbnail_errors"], 1)
         self.assertIn("Source unavailable", (self.output / "report.html").read_text())
 
+    def test_neighborhood_recovers_sharp_frame_between_anchors_and_records_evidence(self):
+        self.build()
+        video = self.root / "blur.avi"
+        yy, xx = np.indices((64, 96))
+        gray = (((xx // 4 + yy // 4) % 2) * 160 + 40).astype(np.uint8)
+        sharp = np.repeat(gray[:, :, None], 3, axis=2)
+        blurred = cv2.GaussianBlur(sharp, (15, 15), 4)
+        writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"MJPG"), 10, (96, 64))
+        self.assertTrue(writer.isOpened())
+        try:
+            for number in range(40):
+                writer.write(sharp if number == 19 else blurred)
+        finally:
+            writer.release()
+        _, shots, times = detect_shots(video, threshold=1000)
+        self.assertEqual(select_frames(shots[0], times), [20])
+        summaries = []
+        for output in (self.output, self.root / "repeat"):
+            query_video(video, self.index, output, search_device="cpu", threshold=1000,
+                        sampling_mode="neighborhood", neighborhood_seconds=0.25, batch_size=2)
+            result = json.loads((output / "results.json").read_text())
+            audit = json.loads((output / "sampling.json").read_text())
+            queries = result["shots"][0]["queries"]
+            self.assertIn(19, [query["frame_number"] for query in queries])
+            self.assertEqual(result["sampling"]["anchor_count"], 1)
+            self.assertEqual(result["sampling"]["evidence_sha256"], file_hash(output / "sampling.json"))
+            for query in queries:
+                self.assertTrue(query["sampling"])
+                with Image.open(output / query["thumbnail"]) as frame:
+                    self.assertEqual(frame.size, (96, 64))
+            self.assertIn("Full sampling comparisons", (output / "report.html").read_text())
+            summaries.append(audit)
+        self.assertEqual(summaries[0], summaries[1])
+
     def test_html_escapes_source_names(self):
         (self.images / "image-0.png").rename(self.images / '<img src=x onerror="alert(1)">.png')
         self.build()

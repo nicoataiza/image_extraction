@@ -18,6 +18,7 @@ from .descriptors import SpatialDescriptor
 from .download import write_json
 from .indexing import ensure_separate, file_hash, load_index
 from .selection_decisions import rank_candidates, explain_step, DECISION_PRECISION
+from .view_decisions import VERSION as VIEW_VERSION, rank_views, explain_view
 
 SELECTION_VERSION = "reference-quality-diversity-v2"
 WEIGHTS = {"relevance": 0.35, "quality": 0.20, "reference_layout": 0.20, "feedback": 0.25}
@@ -144,9 +145,25 @@ def _load_feedback(profile_path, output):
     return provenance, anchors, images
 
 
-def select_video_frames(results, output, *, top_k=17, extraction_device="auto", search_device="auto",
-                        batch_size=16, feedback_profile=None, review_path=None, min_relevance=0.65):
-    if top_k <= 0 or batch_size <= 0 or not 0 <= min_relevance <= 1:
+def select_video_frames(results, output, *, top_k=None, extraction_device="auto", search_device="auto",
+                        batch_size=16, feedback_profile=None, review_path=None, min_relevance=None,
+                        selection_mode="best-view", duplicate_similarity=0.85,
+                        temporal_similarity=0.80, temporal_gap_seconds=2.0):
+    if selection_mode not in ("best-view", "legacy"):
+        raise ValueError("Unknown selection mode")
+    if not np.isfinite(duplicate_similarity) or not -1 <= duplicate_similarity <= 1:
+        raise ValueError("Invalid duplicate similarity")
+    if not np.isfinite(temporal_similarity) or not -1 <= temporal_similarity <= 1:
+        raise ValueError("Invalid temporal similarity")
+    if not np.isfinite(temporal_gap_seconds) or temporal_gap_seconds <= 0:
+        raise ValueError("Invalid temporal gap")
+    if selection_mode == "legacy" and top_k is None:
+        top_k = 17
+    best_view = selection_mode == "best-view"
+    if min_relevance is None:
+        min_relevance = 0.85 if best_view else 0.65
+    decision_file = "view_decisions.py" if best_view else "selection_decisions.py"
+    if (top_k is not None and top_k <= 0) or batch_size <= 0 or not 0 <= min_relevance <= 1:
         raise ValueError("top_k/batch_size must be positive and min_relevance must be in [0, 1]")
     source = Path(results).expanduser().resolve()
     output = Path(output).expanduser().resolve()
@@ -173,6 +190,15 @@ def select_video_frames(results, output, *, top_k=17, extraction_device="auto", 
     ensure_separate(Path(manifest["images_root"]), output)
     output.mkdir(parents=True)
     write_json(output / "status.json", {"status": "incomplete"})
+    sampling = dict(data.get("sampling", {}))
+    if sampling.get("evidence"):
+        evidence = (source.parent / sampling["evidence"]).resolve()
+        if not evidence.is_relative_to(source.parent):
+            raise ValueError("Sampling evidence escapes the query directory")
+        shutil.copyfile(evidence, output / "sampling.json")
+        if file_hash(output / "sampling.json") != sampling.get("evidence_sha256"):
+            raise ValueError("Sampling evidence checksum mismatch")
+        sampling["evidence"] = "sampling.json"
     layout = SpatialDescriptor(max_side=256)
     vectors, spatial, records = [], [], []
     (output / "candidates").mkdir()
@@ -192,6 +218,8 @@ def select_video_frames(results, output, *, top_k=17, extraction_device="auto", 
                 records.append({"frame_number": query["frame_number"], "timestamp_seconds": query["timestamp_seconds"],
                                 "shot_id": query["shot_id"], "source_frame": str(path),
                                 "source_sha256": file_hash(path), "thumbnail": relative, "quality_raw": image_quality(image)})
+                if "sampling" in query:
+                    records[-1]["sampling"] = query["sampling"]
                 spatial.append(layout.extract(image))
             vectors.extend(descriptor.extract_batch(images))
     vectors, spatial = np.stack(vectors), np.stack(spatial)
@@ -278,14 +306,19 @@ def select_video_frames(results, output, *, top_k=17, extraction_device="auto", 
             seed_groups.append({"name": anchor["name"], "rows": candidates})
         else:
             missing.append(anchor["name"])
-    automatic, trace, dispositions = rank_candidates(
-        records, similarities, top_k, weights=WEIGHTS, seed_groups=seed_groups)
+    if best_view:
+        automatic, trace, dispositions = rank_views(
+            records, similarities, top_k, weights=WEIGHTS, duplicate_similarity=duplicate_similarity,
+            temporal_similarity=temporal_similarity, max_gap_seconds=temporal_gap_seconds)
+    else:
+        automatic, trace, dispositions = rank_candidates(
+            records, similarities, top_k, weights=WEIGHTS, seed_groups=seed_groups)
     for record, disposition in zip(records, dispositions):
         record["automatic_disposition"] = disposition
         record["weighted_components"] = {key: WEIGHTS[key] * value for key, value in record["components"].items()}
     for step in trace:
         record = records[step["winner"]["row"]]
-        record["automatic_reason"] = explain_step(step)
+        record["automatic_reason"] = explain_view(step) if best_view else explain_step(step)
         record["decision_step"] = step["step"]
     review = None
     final = automatic
@@ -294,7 +327,7 @@ def select_video_frames(results, output, *, top_k=17, extraction_device="auto", 
         review = json.loads(review_path.read_text())
         if review.get("results_sha256") != input_sha256:
             raise ValueError("Review must identify this exact results.json by SHA256")
-        final = validate_review(review, records, top_k)
+        final = validate_review(review, records, top_k if top_k is not None else len(records))
         review = {**review, "path": str(review_path), "sha256": file_hash(review_path)}
     np.save(output / "frame-embeddings.npy", vectors, allow_pickle=False)
     np.save(output / "frame-layouts.npy", spatial, allow_pickle=False)
@@ -324,10 +357,11 @@ def select_video_frames(results, output, *, top_k=17, extraction_device="auto", 
         else:
             record["nearest_selected_frame"] = None
             record["nearest_selected_similarity"] = None
-    report = {"schema_version": 1, "status": "complete", "version": SELECTION_VERSION,
+    report = {"schema_version": 1, "status": "complete", "version": VIEW_VERSION if best_view else SELECTION_VERSION,
               "results_path": str(source), "results_sha256": input_sha256, "video": data["video"],
               "descriptor": descriptor.metadata(), "extraction": descriptor.runtime_metadata(), "search": backend.metadata(),
               "reference_index": data["index"], "candidate_count": len(records),
+              "sampling": sampling,
               "normalization": {"sharpness_log1p_percentiles_10_90": np.percentile(
                   [np.log1p(r["quality_raw"]["laplacian_variance"]) for r in records], (10, 90)).tolist(),
                   "relevance": "clip((mean distinct reference cosine - min_relevance)/(1-min_relevance),0,1)",
@@ -340,14 +374,17 @@ def select_video_frames(results, output, *, top_k=17, extraction_device="auto", 
               "reproducibility": {"decision_precision": DECISION_PRECISION,
                                   "tie_break": "lower frame number after rounding utility to six decimals",
                                   "selection_source_sha256": file_hash(Path(__file__)),
-                                  "decision_source_sha256": file_hash(Path(__file__).with_name("selection_decisions.py")),
+                                  "decision_source_sha256": file_hash(Path(__file__).with_name(decision_file)),
                                   "scope": "Exact decision replay from frozen components and similarities; fresh inference may differ across software/hardware."},
               "files": {path.relative_to(output).as_posix(): {"sha256": file_hash(path)}
                         for path in sorted(output.rglob("*")) if path.is_file() and path.name != "status.json"}, "target_count": top_k,
               "selected_count": len(final), "mode": "reviewed" if review else "automatic_proposal",
               "settings": {"weights": WEIGHTS, "min_relevance": min_relevance,
                            "reference_shortlist": 64, "reference_duplicate_similarity": 0.9995,
-                           "frame_duplicate_similarity": 0.93, "diversity_penalty": 0.5,
+                           "frame_duplicate_similarity": duplicate_similarity if best_view else 0.93,
+                           "diversity_penalty": 0.0 if best_view else 0.5, "selection_mode": selection_mode,
+                           "temporal_similarity": temporal_similarity if best_view else None,
+                           "temporal_gap_seconds": temporal_gap_seconds if best_view else None,
                            "feedback_assignment_similarity": 0.78, "feedback_assignment_margin": 0.05, "batch_size": batch_size},
               "feedback_source": feedback_source, "feedback_examples": anchors,
               "unmatched_feedback_examples": missing,
@@ -373,11 +410,13 @@ def select_video_frames(results, output, *, top_k=17, extraction_device="auto", 
 
 def render_selection(report, path):
     records = {r["frame_number"]: r for r in report["candidates"]}
+    best_view = report["version"] == VIEW_VERSION
+    target_label = report["target_count"] if report["target_count"] is not None else "uncapped"
     title = f"Selected frames · {Path(report['video']['path']).name}"
     with path.open("w", encoding="utf-8") as stream:
         stream.write(f'''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{escape(title)}</title><style>body{{font:16px system-ui;background:#10141a;color:#edf2f7;max-width:1400px;margin:auto;padding:24px}}a{{color:#9fd2ff}}img{{max-width:100%;object-fit:contain}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:20px}}article{{background:#1c2430;padding:14px;border-radius:8px}}.refs{{display:flex;gap:8px}}.refs figure{{margin:0;width:33%;font-size:12px}}.refs img{{height:100px;width:100%}}.main{{width:100%;height:260px}}.muted{{color:#bcc7d6}}summary{{cursor:pointer}}table{{width:100%;border-collapse:collapse;font-size:13px}}td,th{{padding:8px;border-bottom:1px solid #465161;text-align:left}}</style>
-<h1>{escape(title)}</h1><p>{report['selected_count']} selected from {report['candidate_count']} candidates · Target: {report['target_count']}</p>
+<h1>{escape(title)}</h1><p>{report['selected_count']} selected from {report['candidate_count']} candidates · Maximum: {target_label}</p>
 <p>{'Selection explicitly reviewed; automatic rankings retained for comparison.' if report['review'] else 'Selected entirely by code, with no manual frame overrides. Scores explain the ranking; they do not guarantee framing quality or part coverage.'}</p>
 <p><a href="selection.json">Scores and provenance (JSON)</a> · <a href="candidate-scores.csv">Candidate scores (CSV)</a> · <a href="decision-trace.csv">Every decision comparison (CSV)</a> · <a href="selected-frames.zip">Download selected photos (ZIP)</a> · <a href="selected/">Native-resolution frames</a></p>''')
         if report["review"]:
@@ -386,8 +425,11 @@ def render_selection(report, path):
                 stream.write(f'<p>{escape(note)}</p>')
         if report.get("decision_trace"):
             formula = " + ".join(f"{weight:.2f} × {key}" for key, weight in report["settings"]["weights"].items())
-            stream.write(f'<h2>Selection rule</h2><p>Base score = {escape(formula)}.</p><p>Workbook slots select the highest base score within their semantic match pool. Remaining slots maximize base score minus {report["settings"]["diversity_penalty"]:.2f} × similarity to the closest previously selected frame. Candidates with similarity ≥ {report["settings"]["frame_duplicate_similarity"]:.2f} are blocked in that second stage. Ties use the lower frame number after six-decimal rounding.</p>')
-            stream.write(f'<p>Frames with mean distinct-reference cosine below {report["settings"]["min_relevance"]:.2f} are ineligible. The target is {report["target_count"]} frames; the code returns fewer if no qualifying distinct candidates remain.</p>')
+            if best_view:
+                stream.write(f'<h2>Selection rule</h2><p>Base score = {escape(formula)}. First group consecutive frames within a shot (pairwise cosine ≥ {report["settings"]["temporal_similarity"]:.2f}, gap ≤ {report["settings"]["temporal_gap_seconds"]:.1f}s) and keep each group’s highest score. Pick the highest remaining representative, then suppress similar representatives at cosine ≥ {report["settings"]["frame_duplicate_similarity"]:.2f}. Feedback contributes to the score but never reserves a slot or bypasses deduplication. No diversity penalty. Maximum photos: {target_label}.</p>')
+            else:
+                stream.write(f'<h2>Selection rule</h2><p>Base score = {escape(formula)}.</p><p>Workbook slots select the highest base score within their semantic match pool. Remaining slots maximize base score minus {report["settings"]["diversity_penalty"]:.2f} × similarity to the closest previously selected frame. Candidates with similarity ≥ {report["settings"]["frame_duplicate_similarity"]:.2f} are blocked in that second stage. Ties use the lower frame number after six-decimal rounding.</p>')
+                stream.write(f'<p>Frames with mean distinct-reference cosine below {report["settings"]["min_relevance"]:.2f} are ineligible. The target is {report["target_count"]} frames; the code returns fewer if no qualifying distinct candidates remain.</p>')
             stream.write('<p>Components are normalized to 0–1. Reference relevance is mean cosine similarity to up to three distinct collection photos. Quality uses sharpness/exposure proxies. Layout compares spatial descriptors; workbook guidance uses the supplied visual preferences. These weights and thresholds are heuristics, not learned probabilities.</p>')
         stream.write('<div class="grid">')
         for number in report["selected_frame_numbers"]:
@@ -399,6 +441,13 @@ def render_selection(report, path):
             elif r.get("automatic_reason"):
                 stream.write(f'<p>{escape(r["automatic_reason"])}</p>')
                 step = report["decision_trace"][r["decision_step"] - 1]
+                if best_view:
+                    members = [item for item in step["group_members"] if item["frame_number"] != number]
+                    stream.write(f'<details><summary>{len(members)} similar alternatives represented by this photo</summary>')
+                    for item in members:
+                        other = records[item["frame_number"]]
+                        stream.write(f'<p>Frame {other["frame_number"]} · {other["timestamp_seconds"]:.2f}s · score {item["score"]:.6f} · similarity {item["similarity_to_winner"]:.6f}</p><img loading="lazy" style="width:240px" src="{escape(other["thumbnail"], quote=True)}">')
+                    stream.write('</details>')
                 runner = step["runner_up"]
                 if runner:
                     other = records[runner["frame_number"]]
@@ -475,9 +524,11 @@ def replay_selection(selection, output):
     status = json.loads((source / "status.json").read_text())
     if status.get("status") != "complete" or status.get("selection_sha256") != file_hash(selection):
         raise ValueError("Selection is incomplete or its checksum changed")
-    if report.get("version") != SELECTION_VERSION or report.get("review") is not None:
+    if report.get("version") not in (SELECTION_VERSION, VIEW_VERSION) or report.get("review") is not None:
         raise ValueError("Replay requires a current automatic selection with no review override")
-    if report["reproducibility"]["decision_source_sha256"] != file_hash(Path(__file__).with_name("selection_decisions.py")):
+    best_view = report["version"] == VIEW_VERSION
+    decision_file = "view_decisions.py" if best_view else "selection_decisions.py"
+    if report["reproducibility"]["decision_source_sha256"] != file_hash(Path(__file__).with_name(decision_file)):
         raise ValueError("Decision code changed; use the recorded code version for exact replay")
     for name, info in report["files"].items():
         artifact = (source / name).resolve()
@@ -485,10 +536,16 @@ def replay_selection(selection, output):
             raise ValueError(f"Selection artifact checksum mismatch: {name}")
     similarities = np.load(source / "frame-similarities.npy", allow_pickle=False)
     settings = report["settings"]
-    chosen, trace, dispositions = rank_candidates(
-        report["candidates"], similarities, report["target_count"], weights=settings["weights"],
-        seed_groups=report["feedback_pools"], penalty=settings["diversity_penalty"],
-        duplicate_similarity=settings["frame_duplicate_similarity"])
+    if best_view:
+        chosen, trace, dispositions = rank_views(
+            report["candidates"], similarities, report["target_count"], weights=settings["weights"],
+            duplicate_similarity=settings["frame_duplicate_similarity"],
+            temporal_similarity=settings["temporal_similarity"], max_gap_seconds=settings["temporal_gap_seconds"])
+    else:
+        chosen, trace, dispositions = rank_candidates(
+            report["candidates"], similarities, report["target_count"], weights=settings["weights"],
+            seed_groups=report["feedback_pools"], penalty=settings["diversity_penalty"],
+            duplicate_similarity=settings["frame_duplicate_similarity"])
     ids = [report["candidates"][i]["frame_number"] for i in chosen]
     if ids != report["selected_frame_numbers"] or trace != report["decision_trace"]:
         raise ValueError("Replayed decisions do not match the recorded selection")
@@ -507,6 +564,8 @@ def replay_selection(selection, output):
             shutil.copytree(source / folder, output / folder)
     for name in ("frame-embeddings.npy", "frame-layouts.npy", "frame-similarities.npy", "selected-frames.zip"):
         shutil.copyfile(source / name, output / name)
+    if "sampling.json" in report["files"]:
+        shutil.copyfile(source / "sampling.json", output / "sampling.json")
     report["replay"] = {"source": str(selection), "source_sha256": file_hash(selection),
                         "selected_ids_identical": True, "decision_trace_identical": True,
                         "model_inference_performed": False}
