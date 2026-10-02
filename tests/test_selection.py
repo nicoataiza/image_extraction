@@ -206,6 +206,58 @@ class SelectionExportTests(unittest.TestCase):
         self.assertEqual(original["selected_frame_numbers"], replayed["selected_frame_numbers"])
         self.assertEqual((target / "decision-trace.csv").read_bytes(), (self.output / "decision-trace.csv").read_bytes())
 
+    def make_requirements(self):
+        from image_extraction.requirements import REQUIREMENTS_VERSION
+        path = self.root / "requirements"; path.mkdir()
+        categories = [{"id": "red_part", "name": "Red part", "section": "Exterior", "slots": 1, "optional": False},
+                      {"id": "blue_part", "name": "Blue part", "section": "Exterior", "slots": 1, "optional": False},
+                      {"id": "green_part", "name": "Green part", "section": "Interior", "slots": 1, "optional": True}]
+        np.save(path / "reference-vectors.npy", np.array(
+            [[1, 0, 0], [.9, .1, 0], [0, 0, 1], [0, .1, .9], [0, 1, 0], [.5, .5, 0]], dtype=np.float32))
+        records = [{"id": c["id"], "reference_offset": 2 * k, "reference_count": 2,
+                    "framing_good": [0], "framing_poor": [1]} for k, c in enumerate(categories)]
+        records.append({"id": "_other", "reference_offset": 6, "reference_count": 0})
+        records[2]["reference_offset"], records[2]["reference_count"] = 4, 2
+        (path / "categories.json").write_text(json.dumps(categories))
+        (path / "mined.json").write_text(json.dumps(records))
+        (path / "status.json").write_text(json.dumps({"status": "complete"}))
+        (path / "manifest.json").write_text(json.dumps({
+            "version": REQUIREMENTS_VERSION, "index_sha256": "fixture", "model": self.encoder.metadata(),
+            "spec": "spec.md", "spec_sha256": "fixture", "files": {name: {"sha256": file_hash(path / name)} for name in
+                                                                  ("categories.json", "mined.json", "reference-vectors.npy")}}))
+        return path
+
+    def test_required_views_exports_one_best_photo_per_found_category_and_replays(self):
+        import shutil
+        requirements = self.make_requirements()
+        self.run_selection(selection_mode="required-views", requirements=requirements)
+        d = json.loads((self.output / "selection.json").read_text())
+        self.assertEqual(d["version"], "required-category-views-v1")
+        status = {c["category"]: c["status"] for c in d["coverage"]}
+        self.assertEqual(status, {"red_part": "found", "blue_part": "found", "green_part": "optional_not_found"})
+        exports = sorted(p.name for p in (self.output / "selected").iterdir())
+        self.assertEqual(exports, ["01-red_part-1-frame-00000000.png", "02-blue_part-1-frame-00000001.png"])
+        self.assertTrue((self.output / "frame-category-scores.npy").is_file())
+        self.assertIn("Red part", (self.output / "report.html").read_text())
+        shutil.rmtree(self.query); shutil.rmtree(self.collection); shutil.rmtree(requirements)
+        target = self.root / "replayed"
+        with patch("image_extraction.selection.load_index", side_effect=AssertionError("index loaded")):
+            self.assertTrue(replay_selection(self.output / "selection.json", target)["replay_identical"])
+        self.assertEqual(json.loads((target / "selection.json").read_text())["coverage"], d["coverage"])
+
+    def test_required_views_rejects_mismatched_index_and_held_out_feedback(self):
+        requirements = self.make_requirements()
+        with self.assertRaisesRegex(ValueError, "needs --requirements"):
+            self.run_selection(selection_mode="required-views")
+        with self.assertRaisesRegex(ValueError, "held out"):
+            self.run_selection(selection_mode="required-views", requirements=requirements,
+                               feedback_profile=self.root / "profile.json")
+        self.manifest["files"]["index.faiss"]["sha256"] = "other"
+        results = json.loads(self.results.read_text()); results["index"]["sha256"] = "other"
+        self.results.write_text(json.dumps(results))
+        with self.assertRaisesRegex(ValueError, "different reference index"):
+            self.run_selection(selection_mode="required-views", requirements=requirements)
+
     def test_replay_rejects_tampered_frozen_inputs(self):
         self.run_selection(top_k=2, min_relevance=0)
         with (self.output / "frame-similarities.npy").open("ab") as stream:

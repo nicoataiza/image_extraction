@@ -19,8 +19,16 @@ from .download import write_json
 from .indexing import ensure_separate, file_hash, load_index
 from .selection_decisions import rank_candidates, explain_step, DECISION_PRECISION
 from .view_decisions import VERSION as VIEW_VERSION, rank_views, explain_view
+from .requirement_decisions import (VERSION as REQUIRED_VERSION, WEIGHTS as REQUIRED_WEIGHTS,
+                                    explain_required, rank_required)
 
 SELECTION_VERSION = "reference-quality-diversity-v2"
+DECISION_FILES = {SELECTION_VERSION: "selection_decisions.py", VIEW_VERSION: "view_decisions.py",
+                  REQUIRED_VERSION: "requirement_decisions.py"}
+# Within-category near-duplicate cosine by encoder. FG-CLIP 2: VA14022 near-duplicates were
+# 0.95-0.99 while distinct angles and opposite sides were 0.68-0.90. SigLIP 2 maps 0.92 to the
+# same pair percentile on those 189 candidates (single-video estimate, not validated).
+REQUIRED_DUPLICATE = {"siglip2-": 0.955, "fgclip2-": 0.92}
 WEIGHTS = {"relevance": 0.35, "quality": 0.20, "reference_layout": 0.20, "feedback": 0.25}
 
 
@@ -147,10 +155,31 @@ def _load_feedback(profile_path, output):
 
 def select_video_frames(results, output, *, top_k=None, extraction_device="auto", search_device="auto",
                         batch_size=16, feedback_profile=None, review_path=None, min_relevance=None,
-                        selection_mode="best-view", duplicate_similarity=0.85,
-                        temporal_similarity=0.80, temporal_gap_seconds=2.0):
-    if selection_mode not in ("best-view", "legacy"):
+                        selection_mode="best-view", duplicate_similarity=None,
+                        temporal_similarity=None, temporal_gap_seconds=2.0, requirements=None,
+                        confident_margin=0.01, possible_margin=0.02, min_separation_seconds=3.0,
+                        extra_slot_min_score=0.5):
+    if selection_mode not in ("best-view", "legacy", "required-views"):
         raise ValueError("Unknown selection mode")
+    required = selection_mode == "required-views"
+    if required:
+        if requirements is None:
+            raise ValueError("required-views needs --requirements (an index-requirements v2 directory)")
+        if feedback_profile is not None or review_path is not None or top_k is not None:
+            raise ValueError("required-views takes no --feedback-profile (held out as a framing test), "
+                             "--review or --top-k; photo counts come from the specification")
+        if not all(np.isfinite(v) and v >= 0 for v in (confident_margin, possible_margin, min_separation_seconds,
+                                                       extra_slot_min_score)):
+            raise ValueError("Category margins, time separation and extra-slot score must be finite and non-negative")
+        if temporal_similarity is not None:
+            raise ValueError("required-views separates extra photos by time (--min-view-separation-seconds), "
+                             "not --temporal-similarity")
+        version_name = json.loads(Path(results).expanduser().read_text())["index"]["descriptor"]["version"]
+        defaults = (next((v for key, v in REQUIRED_DUPLICATE.items() if version_name.startswith(key)), 0.955), 0.0)
+    else:
+        defaults = (0.85, 0.80)
+    duplicate_similarity = defaults[0] if duplicate_similarity is None else duplicate_similarity
+    temporal_similarity = defaults[1] if temporal_similarity is None else temporal_similarity
     if not np.isfinite(duplicate_similarity) or not -1 <= duplicate_similarity <= 1:
         raise ValueError("Invalid duplicate similarity")
     if not np.isfinite(temporal_similarity) or not -1 <= temporal_similarity <= 1:
@@ -162,7 +191,8 @@ def select_video_frames(results, output, *, top_k=None, extraction_device="auto"
     best_view = selection_mode == "best-view"
     if min_relevance is None:
         min_relevance = 0.85 if best_view else 0.65
-    decision_file = "view_decisions.py" if best_view else "selection_decisions.py"
+    version = REQUIRED_VERSION if required else VIEW_VERSION if best_view else SELECTION_VERSION
+    decision_file = DECISION_FILES[version]
     if (top_k is not None and top_k <= 0) or batch_size <= 0 or not 0 <= min_relevance <= 1:
         raise ValueError("top_k/batch_size must be positive and min_relevance must be in [0, 1]")
     source = Path(results).expanduser().resolve()
@@ -188,6 +218,13 @@ def select_video_frames(results, output, *, top_k=None, extraction_device="auto"
             manifest["files"]["index.faiss"]["sha256"] != data["index"]["sha256"]):
         raise ValueError("Query results do not match the current reference index")
     ensure_separate(Path(manifest["images_root"]), output)
+    requirement_index = None
+    if required:
+        from .requirements import load_requirement_index
+        requirement_index = load_requirement_index(requirements)
+        built = requirement_index["manifest"]
+        if built["index_sha256"] != data["index"]["sha256"] or built["model"] != manifest["descriptor"]:
+            raise ValueError("Requirement index was built from a different reference index or encoder")
     output.mkdir(parents=True)
     write_json(output / "status.json", {"status": "incomplete"})
     sampling = dict(data.get("sampling", {}))
@@ -306,7 +343,36 @@ def select_video_frames(results, output, *, top_k=None, extraction_device="auto"
             seed_groups.append({"name": anchor["name"], "rows": candidates})
         else:
             missing.append(anchor["name"])
-    if best_view:
+    coverage, required_categories = None, None
+    if required:
+        from .requirements import category_spans, framing_scores, knn_scores
+        req_records = requirement_index["records"]
+        # Frozen, rounded inputs: replay never depends on fresh inference or GPU arithmetic.
+        category_scores = np.round(knn_scores(vectors, requirement_index["references"],
+                                              category_spans(req_records)), DECISION_PRECISION)
+        framing = np.round(framing_scores(vectors, requirement_index["references"], req_records[:-1]),
+                           DECISION_PRECISION)
+        np.save(output / "frame-category-scores.npy", category_scores, allow_pickle=False)
+        np.save(output / "frame-framing-scores.npy", framing, allow_pickle=False)
+        required_categories = [{key: c[key] for key in ("id", "name", "section", "slots", "optional")}
+                               for c in requirement_index["categories"]]
+        automatic, coverage, trace, dispositions = rank_required(
+            records, category_scores, framing, similarities, required_categories,
+            duplicate_similarity=duplicate_similarity, min_separation_seconds=min_separation_seconds,
+            extra_slot_min_score=extra_slot_min_score, confident_margin=confident_margin,
+            possible_margin=possible_margin)
+        names = [c["id"] for c in required_categories] + ["background"]
+        for i, record in enumerate(records):
+            top = np.argsort(-category_scores[i], kind="stable")[:3]
+            record["top_categories"] = [{"category": names[j], "score": float(category_scores[i, j])} for j in top]
+        for step in trace:
+            for row in step["pool"]:
+                if row["decision"]["status"] == "selected":
+                    record = records[row["row"]]
+                    record["required_category"] = step["category"]
+                    record["required_slot"] = row["decision"]["slot"]
+                    record["automatic_reason"] = explain_required(step["category"], row, len(step["pool"]))
+    elif best_view:
         automatic, trace, dispositions = rank_views(
             records, similarities, top_k, weights=WEIGHTS, duplicate_similarity=duplicate_similarity,
             temporal_similarity=temporal_similarity, max_gap_seconds=temporal_gap_seconds)
@@ -316,7 +382,7 @@ def select_video_frames(results, output, *, top_k=None, extraction_device="auto"
     for record, disposition in zip(records, dispositions):
         record["automatic_disposition"] = disposition
         record["weighted_components"] = {key: WEIGHTS[key] * value for key, value in record["components"].items()}
-    for step in trace:
+    for step in trace if not required else ():
         record = records[step["winner"]["row"]]
         record["automatic_reason"] = explain_view(step) if best_view else explain_step(step)
         record["decision_step"] = step["step"]
@@ -337,7 +403,8 @@ def select_video_frames(results, output, *, top_k=None, extraction_device="auto"
     for rank, i in enumerate(final, 1):
         record = records[i]
         suffix = Path(record["source_frame"]).suffix.lower()
-        relative = f"selected/{rank:02d}-frame-{record['frame_number']:08d}{suffix}"
+        label = f"{record['required_category']}-{record['required_slot']}-" if required else ""
+        relative = f"selected/{rank:02d}-{label}frame-{record['frame_number']:08d}{suffix}"
         shutil.copyfile(record["source_frame"], output / relative)
         if file_hash(output / relative) != record["source_sha256"]:
             raise ValueError("A query frame changed during selection")
@@ -357,7 +424,7 @@ def select_video_frames(results, output, *, top_k=None, extraction_device="auto"
         else:
             record["nearest_selected_frame"] = None
             record["nearest_selected_similarity"] = None
-    report = {"schema_version": 1, "status": "complete", "version": VIEW_VERSION if best_view else SELECTION_VERSION,
+    report = {"schema_version": 1, "status": "complete", "version": version,
               "results_path": str(source), "results_sha256": input_sha256, "video": data["video"],
               "descriptor": descriptor.metadata(), "extraction": descriptor.runtime_metadata(), "search": backend.metadata(),
               "reference_index": data["index"], "candidate_count": len(records),
@@ -381,11 +448,23 @@ def select_video_frames(results, output, *, top_k=None, extraction_device="auto"
               "selected_count": len(final), "mode": "reviewed" if review else "automatic_proposal",
               "settings": {"weights": WEIGHTS, "min_relevance": min_relevance,
                            "reference_shortlist": 64, "reference_duplicate_similarity": 0.9995,
-                           "frame_duplicate_similarity": duplicate_similarity if best_view else 0.93,
-                           "diversity_penalty": 0.0 if best_view else 0.5, "selection_mode": selection_mode,
+                           "frame_duplicate_similarity": duplicate_similarity if best_view or required else 0.93,
+                           "diversity_penalty": 0.0 if best_view or required else 0.5, "selection_mode": selection_mode,
                            "temporal_similarity": temporal_similarity if best_view else None,
                            "temporal_gap_seconds": temporal_gap_seconds if best_view else None,
                            "feedback_assignment_similarity": 0.78, "feedback_assignment_margin": 0.05, "batch_size": batch_size},
+              "requirements": None if not required else {
+                  "path": requirement_index["path"], "manifest_sha256": requirement_index["manifest_sha256"],
+                  "version": requirement_index["manifest"]["version"], "spec": requirement_index["manifest"]["spec"],
+                  "spec_sha256": requirement_index["manifest"]["spec_sha256"],
+                  "categories": required_categories, "weights": REQUIRED_WEIGHTS,
+                  "confident_margin": confident_margin, "possible_margin": possible_margin,
+                  "min_separation_seconds": min_separation_seconds, "extra_slot_min_score": extra_slot_min_score,
+                  "rule": ("Each frame joins only its top k-NN category (background joins none). Within a category, "
+                           "rank by weighted match and framing (relative to the best frame over 0.10) and quality; "
+                           "extra photos need time separation, similarity below the duplicate threshold and, for "
+                           "fixed photo counts, a minimum score.")},
+              "coverage": coverage,
               "feedback_source": feedback_source, "feedback_examples": anchors,
               "unmatched_feedback_examples": missing,
               "automatic_frame_numbers": [records[i]["frame_number"] for i in automatic],
@@ -408,7 +487,62 @@ def select_video_frames(results, output, *, top_k=None, extraction_device="auto"
             "mode": report["mode"], "seconds": report["seconds"]}
 
 
+STATUS_TEXT = {"found": "Found", "possible": "Possible — not exported", "not_found": "Not found",
+               "optional_not_found": "Optional · not found"}
+
+
+def render_required(report, path):
+    """Coverage-first page: one section per specification category, in specification order."""
+    records = {r["frame_number"]: r for r in report["candidates"]}
+    settings, requirements = report["settings"], report["requirements"]
+    title = f"Required photos · {Path(report['video']['path']).name}"
+    found = sum(c["status"] == "found" for c in report["coverage"])
+    rows, sections = [], []
+    for entry in report["coverage"]:
+        status = STATUS_TEXT[entry["status"]]
+        if entry["status"] == "found" and entry["confidence"] == "check":
+            status += " · check"
+        slots = "all distinct" if entry["slots"] is None else entry["slots"]
+        exported = len(entry.get("selected_frames", []))
+        rows.append(f'<tr><td><a href="#{entry["category"]}">{escape(entry["name"])}</a></td><td>{status}</td>'
+                    f'<td>{exported} / {slots}</td><td>{entry["pool_size"]}</td></tr>')
+        cards = []
+        for number in entry.get("selected_frames", []):
+            r = records[number]
+            cards.append(f'<article><a href="{escape(r["export"], quote=True)}"><img class="main" src="{escape(r["export"], quote=True)}"></a>'
+                         f'<p>{r["timestamp_seconds"]:.2f}s · frame {number} · slot {r["required_slot"]}</p>'
+                         f'<p class="muted">{escape(r["automatic_reason"])}</p></article>')
+        if entry["status"] == "possible":
+            r = records[entry["frame_number"]]
+            cards.append(f'<article><img class="main" src="{escape(r["thumbnail"], quote=True)}"><p>Closest frame {entry["frame_number"]} '
+                         f'({r["timestamp_seconds"]:.2f}s) ranks {escape(entry["frame_top_category"])} first; this category is '
+                         f'{entry["gap_to_frame_top"]:.4f} behind. Not exported; review it.</p></article>')
+        alternatives = ""
+        trace = next((t for t in report["decision_trace"] if t["category"] == entry["category"]), None)
+        if trace and len(trace["pool"]) > exported:
+            items = "".join(
+                f'<p>Frame {row["frame_number"]} · score {row["score"]:.4f} · {escape(row["decision"]["status"].replace("_", " "))}'
+                f'{" → frame " + str(row["decision"]["selected_frame"]) if "selected_frame" in row["decision"] else ""}</p>'
+                f'<img loading="lazy" style="width:220px" src="{escape(records[row["frame_number"]]["thumbnail"], quote=True)}">'
+                for row in trace["pool"] if row["decision"]["status"] != "selected")
+            alternatives = f'<details><summary>{len(trace["pool"]) - exported} other frame(s) in this category</summary>{items}</details>'
+        sections.append(f'<section id="{entry["category"]}"><h2>{escape(entry["name"])} <span class="muted">· {status}</span></h2>'
+                        f'<div class="grid">{"".join(cards)}</div>{alternatives}</section>')
+    weights = ", ".join(f"{w:.2f} × {k}" for k, w in requirements["weights"].items())
+    page = f'''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{escape(title)}</title><style>body{{font:16px system-ui;background:#10141a;color:#edf2f7;max-width:1400px;margin:auto;padding:24px}}a{{color:#9fd2ff}}img{{max-width:100%;object-fit:contain}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:20px}}article{{background:#1c2430;padding:14px;border-radius:8px}}.main{{width:100%;height:260px}}.muted{{color:#bcc7d6}}summary{{cursor:pointer}}table{{width:100%;border-collapse:collapse;font-size:14px}}td,th{{padding:6px 8px;border-bottom:1px solid #465161;text-align:left}}section{{margin-top:28px}}</style>
+<h1>{escape(title)}</h1><p>{report["selected_count"]} photos covering {found} of {len(report["coverage"])} specification categories, from {report["candidate_count"]} candidate frames. Selected entirely by code.</p>
+<p><a href="selection.json">Scores and provenance (JSON)</a> · <a href="candidate-scores.csv">Candidate scores (CSV)</a> · <a href="decision-trace.csv">Every category decision (CSV)</a> · <a href="selected-frames.zip">Download selected photos (ZIP)</a></p>
+<h2>Rule</h2><p>Each frame joins only its highest-scoring category (mean of its five closest mined reference photos per category); frames closest to the background join none. Within a category, frames are ranked by {escape(weights)}; match and framing score 1 for the category's best frame and fall to 0 at 0.10 below it. Framing compares the frame with that category's best- and worst-framed references, chosen by the specification's framing text. Extra photos (left/right, views, parts) must be at least {requirements["min_separation_seconds"]:.1f}s from the category's other photos, below {settings["frame_duplicate_similarity"]:.2f} similarity to each, and (except "capture all" categories) score at least {requirements["extra_slot_min_score"]:.2f}. "Check" marks a category whose best frame beat its runner-up category by less than {requirements["confident_margin"]:.3f}.</p>
+<p class="muted">Not found means no frame ranked that category first; it does not prove the part is absent. Sides are not verified. Framing and VIN readability are learned from reference photos, not measured.</p>
+<table><tr><th>Category</th><th>Status</th><th>Photos / wanted</th><th>Frames in category</th></tr>{"".join(rows)}</table>
+{"".join(sections)}<details><summary>Scoring limitations</summary>{"".join(f"<p>{escape(x)}</p>" for x in report["limitations"])}</details></html>'''
+    path.write_text(page, encoding="utf-8")
+
+
 def render_selection(report, path):
+    if report["version"] == REQUIRED_VERSION:
+        return render_required(report, path)
     records = {r["frame_number"]: r for r in report["candidates"]}
     best_view = report["version"] == VIEW_VERSION
     target_label = report["target_count"] if report["target_count"] is not None else "uncapped"
@@ -500,6 +634,19 @@ def write_audit_tables(report, output):
                              **record["components"],
                              "automatic_status": record["automatic_disposition"]["status"],
                              "selected_rank": record.get("selected_rank", "")})
+    if report["version"] == REQUIRED_VERSION:
+        with (output / "decision-trace.csv").open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, fieldnames=["category", "frame_number", "timestamp_seconds", "score",
+                "category_score", "framing_score", "margin", "match", "framing", "quality", "status", "slot",
+                "selected_frame", "similarity"])
+            writer.writeheader()
+            for step in report["decision_trace"]:
+                for row in step["pool"]:
+                    writer.writerow({"category": step["category"], **{key: row[key] for key in (
+                        "frame_number", "timestamp_seconds", "score", "category_score", "framing_score", "margin")},
+                        **row["components"], **{key: row["decision"].get(key, "") for key in (
+                            "status", "slot", "selected_frame", "similarity")}})
+        return
     with (output / "decision-trace.csv").open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=["step", "phase", "feedback_example", "winner",
             "frame_number", "base_score", "nearest_previously_selected", "max_similarity",
@@ -524,10 +671,11 @@ def replay_selection(selection, output):
     status = json.loads((source / "status.json").read_text())
     if status.get("status") != "complete" or status.get("selection_sha256") != file_hash(selection):
         raise ValueError("Selection is incomplete or its checksum changed")
-    if report.get("version") not in (SELECTION_VERSION, VIEW_VERSION) or report.get("review") is not None:
+    if report.get("version") not in DECISION_FILES or report.get("review") is not None:
         raise ValueError("Replay requires a current automatic selection with no review override")
     best_view = report["version"] == VIEW_VERSION
-    decision_file = "view_decisions.py" if best_view else "selection_decisions.py"
+    required = report["version"] == REQUIRED_VERSION
+    decision_file = DECISION_FILES[report["version"]]
     if report["reproducibility"]["decision_source_sha256"] != file_hash(Path(__file__).with_name(decision_file)):
         raise ValueError("Decision code changed; use the recorded code version for exact replay")
     for name, info in report["files"].items():
@@ -536,7 +684,18 @@ def replay_selection(selection, output):
             raise ValueError(f"Selection artifact checksum mismatch: {name}")
     similarities = np.load(source / "frame-similarities.npy", allow_pickle=False)
     settings = report["settings"]
-    if best_view:
+    coverage = report.get("coverage")
+    if required:
+        requirements = report["requirements"]
+        chosen, coverage, trace, dispositions = rank_required(
+            report["candidates"], np.load(source / "frame-category-scores.npy", allow_pickle=False),
+            np.load(source / "frame-framing-scores.npy", allow_pickle=False), similarities,
+            requirements["categories"], weights=requirements["weights"],
+            duplicate_similarity=settings["frame_duplicate_similarity"],
+            min_separation_seconds=requirements["min_separation_seconds"],
+            extra_slot_min_score=requirements["extra_slot_min_score"],
+            confident_margin=requirements["confident_margin"], possible_margin=requirements["possible_margin"])
+    elif best_view:
         chosen, trace, dispositions = rank_views(
             report["candidates"], similarities, report["target_count"], weights=settings["weights"],
             duplicate_similarity=settings["frame_duplicate_similarity"],
@@ -547,7 +706,7 @@ def replay_selection(selection, output):
             seed_groups=report["feedback_pools"], penalty=settings["diversity_penalty"],
             duplicate_similarity=settings["frame_duplicate_similarity"])
     ids = [report["candidates"][i]["frame_number"] for i in chosen]
-    if ids != report["selected_frame_numbers"] or trace != report["decision_trace"]:
+    if ids != report["selected_frame_numbers"] or trace != report["decision_trace"] or coverage != report.get("coverage"):
         raise ValueError("Replayed decisions do not match the recorded selection")
     if dispositions != [record["automatic_disposition"] for record in report["candidates"]]:
         raise ValueError("Replayed exclusion reasons do not match")
@@ -562,7 +721,8 @@ def replay_selection(selection, output):
     for folder in ("selected", "references", "feedback", "candidates"):
         if (source / folder).exists():
             shutil.copytree(source / folder, output / folder)
-    for name in ("frame-embeddings.npy", "frame-layouts.npy", "frame-similarities.npy", "selected-frames.zip"):
+    for name in ("frame-embeddings.npy", "frame-layouts.npy", "frame-similarities.npy", "selected-frames.zip",
+                 *(("frame-category-scores.npy", "frame-framing-scores.npy") if required else ())):
         shutil.copyfile(source / name, output / name)
     if "sampling.json" in report["files"]:
         shutil.copyfile(source / "sampling.json", output / "sampling.json")
