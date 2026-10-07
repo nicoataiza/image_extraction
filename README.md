@@ -477,7 +477,12 @@ angles, lights, wheels, VIN plates, engine bay parts, interior controls, ...), w
 photo counts from their sides/views and optional `framing:`/`avoid:` composition rules.
 The collection is unlabeled, so `index-requirements` uses the index's own text encoder
 to mine reference photos per category. It splits each category's references into best-
-and worst-framed groups by its framing rule. This takes seconds and re-encodes nothing.
+and worst-framed groups by its framing rule, and the whole-vehicle references into front-
+and rear-facing groups by their view prompts. The specification stays in Australian English;
+prompt wording the encoder misreads is replaced ("guard" → "fender", "door trim" → "interior
+door trim", "console lid" → "center console armrest") and US equivalents are added for others
+(tyre/tire, bonnet/hood, glovebox/glove compartment, ...). Video frames are compared with the
+mined reference photos, never with text. This takes seconds and re-encodes nothing.
 
 The tested encoder for this is [FG-CLIP 2 base](https://huggingface.co/qihoo360/fg-clip2-base)
 (Apache-2.0, revision `430fbc8`), a fine-grained SigLIP 2-style model. Its reviewed model
@@ -489,21 +494,25 @@ OMP_NUM_THREADS=4 .venv/bin/python -m image_extraction index \
   --descriptor fgclip2 --extraction-device cuda --search-device cuda --extraction-batch-size 32
 OMP_NUM_THREADS=4 .venv/bin/python -m image_extraction index-requirements \
   --index artifacts/wcp-all-fgclip2 --spec vehicle_angles.md \
-  --output artifacts/wcp-all-fgclip2-requirements-v2 --device cuda
+  --output artifacts/wcp-all-fgclip2-requirements-v4 --device cuda
 OMP_NUM_THREADS=4 .venv/bin/python -m image_extraction query \
   --video videos/NEW_VIDEO.mp4 --index artifacts/wcp-all-fgclip2 \
   --output outputs/NEW_VIDEO/fgclip2-semantic-best-local --extraction-device cuda --search-device cuda \
-  --interval-seconds 1 --sampling-mode best-local --neighborhood-seconds 0.5 --top-k 10
+  --interval-seconds 1 --sampling-mode best-local --neighborhood-seconds 0.5 --top-k 5
 OMP_NUM_THREADS=4 .venv/bin/python -m image_extraction select-frames \
   --results outputs/NEW_VIDEO/fgclip2-semantic-best-local/results.json \
   --output outputs/NEW_VIDEO/fgclip2-selected-required \
-  --selection-mode required-views --requirements artifacts/wcp-all-fgclip2-requirements-v2 \
+  --selection-mode required-views --requirements artifacts/wcp-all-fgclip2-requirements-v4 \
   --extraction-device cuda --search-device cuda
 ```
 
 `required-views` puts each frame in its single best-matching category (or none).
-Within a category it ranks frames by 0.40 part match, 0.35 framing and 0.25
-sharpness/exposure. Extra photos (other angles or sides) must be at least 3 s apart,
+Seven often-confused categories (roof accessories, snorkel, fuel filter, engine cold side,
+pedals, glovebox, rear heater controls) also need the frame to beat its runner-up category
+by 0.02 (`--strict-margin`). Within a category it ranks frames by 0.40 part match, 0.35
+framing and 0.25 sharpness/exposure. The whole vehicle first takes its best front-facing
+and rear-facing photo (`--orientation-margin`); a well-framed whole-car frame that ranked
+headlight, taillight or towbar first may fill those two slots. Extra photos (other angles or sides) must be at least 3 s apart,
 not near-duplicates, and reasonably strong. The report lists every category as found,
 possible (reported, not exported) or not found, and flags close calls with "check".
 Exports are named by category, and `replay-selection` reproduces the decisions offline.

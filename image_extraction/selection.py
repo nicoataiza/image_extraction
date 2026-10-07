@@ -19,12 +19,14 @@ from .download import write_json
 from .indexing import ensure_separate, file_hash, load_index
 from .selection_decisions import rank_candidates, explain_step, DECISION_PRECISION
 from .view_decisions import VERSION as VIEW_VERSION, rank_views, explain_view
-from .requirement_decisions import (VERSION as REQUIRED_VERSION, WEIGHTS as REQUIRED_WEIGHTS,
-                                    explain_required, rank_required)
+from .requirement_decisions import VERSION as REQUIRED_V1, rank_required as rank_required_v1
+from .requirement_decisions_v2 import (VERSION as REQUIRED_VERSION, WEIGHTS as REQUIRED_WEIGHTS,
+                                       STRICT_CATEGORIES, explain_required, rank_required)
 
 SELECTION_VERSION = "reference-quality-diversity-v2"
 DECISION_FILES = {SELECTION_VERSION: "selection_decisions.py", VIEW_VERSION: "view_decisions.py",
-                  REQUIRED_VERSION: "requirement_decisions.py"}
+                  REQUIRED_V1: "requirement_decisions.py", REQUIRED_VERSION: "requirement_decisions_v2.py"}
+REQUIRED_VERSIONS = (REQUIRED_V1, REQUIRED_VERSION)
 # Within-category near-duplicate cosine by encoder. FG-CLIP 2: VA14022 near-duplicates were
 # 0.95-0.99 while distinct angles and opposite sides were 0.68-0.90. SigLIP 2 maps 0.92 to the
 # same pair percentile on those 189 candidates (single-video estimate, not validated).
@@ -158,18 +160,18 @@ def select_video_frames(results, output, *, top_k=None, extraction_device="auto"
                         selection_mode="best-view", duplicate_similarity=None,
                         temporal_similarity=None, temporal_gap_seconds=2.0, requirements=None,
                         confident_margin=0.01, possible_margin=0.02, min_separation_seconds=3.0,
-                        extra_slot_min_score=0.5):
+                        extra_slot_min_score=0.5, strict_margin=0.02, orientation_margin=0.02):
     if selection_mode not in ("best-view", "legacy", "required-views"):
         raise ValueError("Unknown selection mode")
     required = selection_mode == "required-views"
     if required:
         if requirements is None:
-            raise ValueError("required-views needs --requirements (an index-requirements v2 directory)")
+            raise ValueError("required-views needs --requirements (an index-requirements v4 directory)")
         if feedback_profile is not None or review_path is not None or top_k is not None:
             raise ValueError("required-views takes no --feedback-profile (held out as a framing test), "
                              "--review or --top-k; photo counts come from the specification")
         if not all(np.isfinite(v) and v >= 0 for v in (confident_margin, possible_margin, min_separation_seconds,
-                                                       extra_slot_min_score)):
+                                                       extra_slot_min_score, strict_margin, orientation_margin)):
             raise ValueError("Category margins, time separation and extra-slot score must be finite and non-negative")
         if temporal_similarity is not None:
             raise ValueError("required-views separates extra photos by time (--min-view-separation-seconds), "
@@ -353,14 +355,18 @@ def select_video_frames(results, output, *, top_k=None, extraction_device="auto"
         framing = np.round(framing_scores(vectors, requirement_index["references"], req_records[:-1]),
                            DECISION_PRECISION)
         np.save(output / "frame-category-scores.npy", category_scores, allow_pickle=False)
+        orientation = np.round(framing_scores(vectors, requirement_index["references"], req_records[:-1],
+                                              groups=("orientation_front", "orientation_rear")), DECISION_PRECISION)
         np.save(output / "frame-framing-scores.npy", framing, allow_pickle=False)
-        required_categories = [{key: c[key] for key in ("id", "name", "section", "slots", "optional")}
-                               for c in requirement_index["categories"]]
+        np.save(output / "frame-orientation-scores.npy", orientation, allow_pickle=False)
+        required_categories = [{**{key: c[key] for key in ("id", "name", "section", "slots", "optional")},
+                                "oriented": bool(r.get("orientation_front") and r.get("orientation_rear"))}
+                               for c, r in zip(requirement_index["categories"], req_records)]
         automatic, coverage, trace, dispositions = rank_required(
-            records, category_scores, framing, similarities, required_categories,
+            records, category_scores, framing, orientation, similarities, required_categories,
             duplicate_similarity=duplicate_similarity, min_separation_seconds=min_separation_seconds,
             extra_slot_min_score=extra_slot_min_score, confident_margin=confident_margin,
-            possible_margin=possible_margin)
+            possible_margin=possible_margin, strict_margin=strict_margin, orientation_margin=orientation_margin)
         names = [c["id"] for c in required_categories] + ["background"]
         for i, record in enumerate(records):
             top = np.argsort(-category_scores[i], kind="stable")[:3]
@@ -371,6 +377,8 @@ def select_video_frames(results, output, *, top_k=None, extraction_device="auto"
                     record = records[row["row"]]
                     record["required_category"] = step["category"]
                     record["required_slot"] = row["decision"]["slot"]
+                    if "view" in row["decision"]:
+                        record["required_view"] = row["decision"]["view"]
                     record["automatic_reason"] = explain_required(step["category"], row, len(step["pool"]))
     elif best_view:
         automatic, trace, dispositions = rank_views(
@@ -403,7 +411,8 @@ def select_video_frames(results, output, *, top_k=None, extraction_device="auto"
     for rank, i in enumerate(final, 1):
         record = records[i]
         suffix = Path(record["source_frame"]).suffix.lower()
-        label = f"{record['required_category']}-{record['required_slot']}-" if required else ""
+        label = (f"{record['required_category']}-{record.get('required_view', record['required_slot'])}-"
+                 if required else "")
         relative = f"selected/{rank:02d}-{label}frame-{record['frame_number']:08d}{suffix}"
         shutil.copyfile(record["source_frame"], output / relative)
         if file_hash(output / relative) != record["source_sha256"]:
@@ -460,10 +469,15 @@ def select_video_frames(results, output, *, top_k=None, extraction_device="auto"
                   "categories": required_categories, "weights": REQUIRED_WEIGHTS,
                   "confident_margin": confident_margin, "possible_margin": possible_margin,
                   "min_separation_seconds": min_separation_seconds, "extra_slot_min_score": extra_slot_min_score,
-                  "rule": ("Each frame joins only its top k-NN category (background joins none). Within a category, "
-                           "rank by weighted match and framing (relative to the best frame over 0.10) and quality; "
-                           "extra photos need time separation, similarity below the duplicate threshold and, for "
-                           "fixed photo counts, a minimum score.")},
+                  "strict_categories": list(STRICT_CATEGORIES), "strict_margin": strict_margin,
+                  "orientation_margin": orientation_margin,
+                  "rule": ("Each frame joins only its top k-NN category (background joins none); for the strict "
+                           "categories it must also beat its runner-up by the strict margin. Within a category, "
+                           "rank by weighted match and framing (relative to the best frame over 0.10) and quality. "
+                           "The whole vehicle first takes its best front- and rear-facing frames, including whole-car "
+                           "frames within the possible margin of another top category. Extra photos need time "
+                           "separation, similarity below the duplicate threshold and, for fixed photo counts, a "
+                           "minimum score.")},
               "coverage": coverage,
               "feedback_source": feedback_source, "feedback_examples": anchors,
               "unmatched_feedback_examples": missing,
@@ -489,6 +503,10 @@ def select_video_frames(results, output, *, top_k=None, extraction_device="auto"
 
 STATUS_TEXT = {"found": "Found", "possible": "Possible — not exported", "not_found": "Not found",
                "optional_not_found": "Optional · not found"}
+POSSIBLE_TEXT = {"near_top_category": "ranks {top} first; this category is {gap:.4f} behind",
+                 "below_category_margin": "ranks this category first, but only {margin:.4f} above its runner-up "
+                                          "(this category needs {required:.2f})",
+                 "exported_as_other_category": "was exported as a {exported} front/rear view"}
 
 
 def render_required(report, path):
@@ -502,6 +520,9 @@ def render_required(report, path):
         status = STATUS_TEXT[entry["status"]]
         if entry["status"] == "found" and entry["confidence"] == "check":
             status += " · check"
+        if entry.get("orientation"):
+            missing = [view for view in ("front", "rear") if entry["orientation"].get(view) is None]
+            status += f" · no clear {' or '.join(missing)} view" if missing else " · front and rear"
         slots = "all distinct" if entry["slots"] is None else entry["slots"]
         exported = len(entry.get("selected_frames", []))
         rows.append(f'<tr><td><a href="#{entry["category"]}">{escape(entry["name"])}</a></td><td>{status}</td>'
@@ -509,14 +530,17 @@ def render_required(report, path):
         cards = []
         for number in entry.get("selected_frames", []):
             r = records[number]
+            view = f' · {r["required_view"]} view' if "required_view" in r else ""
             cards.append(f'<article><a href="{escape(r["export"], quote=True)}"><img class="main" src="{escape(r["export"], quote=True)}"></a>'
-                         f'<p>{r["timestamp_seconds"]:.2f}s · frame {number} · slot {r["required_slot"]}</p>'
+                         f'<p>{r["timestamp_seconds"]:.2f}s · frame {number} · slot {r["required_slot"]}{view}</p>'
                          f'<p class="muted">{escape(r["automatic_reason"])}</p></article>')
         if entry["status"] == "possible":
             r = records[entry["frame_number"]]
+            why = POSSIBLE_TEXT[entry.get("reason", "near_top_category")].format(
+                top=escape(entry["frame_top_category"]), gap=entry["gap_to_frame_top"], margin=entry.get("frame_margin", 0),
+                required=entry.get("required_margin", 0), exported=escape(entry.get("exported_as", "")))
             cards.append(f'<article><img class="main" src="{escape(r["thumbnail"], quote=True)}"><p>Closest frame {entry["frame_number"]} '
-                         f'({r["timestamp_seconds"]:.2f}s) ranks {escape(entry["frame_top_category"])} first; this category is '
-                         f'{entry["gap_to_frame_top"]:.4f} behind. Not exported; review it.</p></article>')
+                         f'({r["timestamp_seconds"]:.2f}s) {why}. Not exported; review it.</p></article>')
         alternatives = ""
         trace = next((t for t in report["decision_trace"] if t["category"] == entry["category"]), None)
         if trace and len(trace["pool"]) > exported:
@@ -529,11 +553,18 @@ def render_required(report, path):
         sections.append(f'<section id="{entry["category"]}"><h2>{escape(entry["name"])} <span class="muted">· {status}</span></h2>'
                         f'<div class="grid">{"".join(cards)}</div>{alternatives}</section>')
     weights = ", ".join(f"{w:.2f} × {k}" for k, w in requirements["weights"].items())
+    v2_rule = "" if report["version"] == REQUIRED_V1 else (
+        f'<p>Strict categories ({escape(", ".join(requirements["strict_categories"]))}) also need a frame that beats its '
+        f'runner-up category by {requirements["strict_margin"]:.3f}; otherwise they are reported as possible. The whole '
+        f'vehicle first takes its best front-facing and best rear-facing frame (orientation at least '
+        f'±{requirements["orientation_margin"]:.2f}, from front- and rear-facing reference groups). Whole-car frames whose '
+        f'top category is another part may fill only those two slots, when the vehicle is within '
+        f'{requirements["possible_margin"]:.2f} of their top score; they are then exported only as the vehicle.</p>')
     page = f'''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{escape(title)}</title><style>body{{font:16px system-ui;background:#10141a;color:#edf2f7;max-width:1400px;margin:auto;padding:24px}}a{{color:#9fd2ff}}img{{max-width:100%;object-fit:contain}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:20px}}article{{background:#1c2430;padding:14px;border-radius:8px}}.main{{width:100%;height:260px}}.muted{{color:#bcc7d6}}summary{{cursor:pointer}}table{{width:100%;border-collapse:collapse;font-size:14px}}td,th{{padding:6px 8px;border-bottom:1px solid #465161;text-align:left}}section{{margin-top:28px}}</style>
 <h1>{escape(title)}</h1><p>{report["selected_count"]} photos covering {found} of {len(report["coverage"])} specification categories, from {report["candidate_count"]} candidate frames. Selected entirely by code.</p>
 <p><a href="selection.json">Scores and provenance (JSON)</a> · <a href="candidate-scores.csv">Candidate scores (CSV)</a> · <a href="decision-trace.csv">Every category decision (CSV)</a> · <a href="selected-frames.zip">Download selected photos (ZIP)</a></p>
-<h2>Rule</h2><p>Each frame joins only its highest-scoring category (mean of its five closest mined reference photos per category); frames closest to the background join none. Within a category, frames are ranked by {escape(weights)}; match and framing score 1 for the category's best frame and fall to 0 at 0.10 below it. Framing compares the frame with that category's best- and worst-framed references, chosen by the specification's framing text. Extra photos (left/right, views, parts) must be at least {requirements["min_separation_seconds"]:.1f}s from the category's other photos, below {settings["frame_duplicate_similarity"]:.2f} similarity to each, and (except "capture all" categories) score at least {requirements["extra_slot_min_score"]:.2f}. "Check" marks a category whose best frame beat its runner-up category by less than {requirements["confident_margin"]:.3f}.</p>
+<h2>Rule</h2><p>Each frame joins only its highest-scoring category (mean of its five closest mined reference photos per category); frames closest to the background join none. Within a category, frames are ranked by {escape(weights)}; match and framing score 1 for the category's best frame and fall to 0 at 0.10 below it. Framing compares the frame with that category's best- and worst-framed references, chosen by the specification's framing text. Extra photos (left/right, views, parts) must be at least {requirements["min_separation_seconds"]:.1f}s from the category's other photos, below {settings["frame_duplicate_similarity"]:.2f} similarity to each, and (except "capture all" categories) score at least {requirements["extra_slot_min_score"]:.2f}. "Check" marks a category whose best frame beat its runner-up category by less than {requirements["confident_margin"]:.3f}.</p>{v2_rule}
 <p class="muted">Not found means no frame ranked that category first; it does not prove the part is absent. Sides are not verified. Framing and VIN readability are learned from reference photos, not measured.</p>
 <table><tr><th>Category</th><th>Status</th><th>Photos / wanted</th><th>Frames in category</th></tr>{"".join(rows)}</table>
 {"".join(sections)}<details><summary>Scoring limitations</summary>{"".join(f"<p>{escape(x)}</p>" for x in report["limitations"])}</details></html>'''
@@ -541,7 +572,7 @@ def render_required(report, path):
 
 
 def render_selection(report, path):
-    if report["version"] == REQUIRED_VERSION:
+    if report["version"] in REQUIRED_VERSIONS:
         return render_required(report, path)
     records = {r["frame_number"]: r for r in report["candidates"]}
     best_view = report["version"] == VIEW_VERSION
@@ -634,18 +665,21 @@ def write_audit_tables(report, output):
                              **record["components"],
                              "automatic_status": record["automatic_disposition"]["status"],
                              "selected_rank": record.get("selected_rank", "")})
-    if report["version"] == REQUIRED_VERSION:
+    if report["version"] in REQUIRED_VERSIONS:
+        v2 = report["version"] == REQUIRED_VERSION
+        extra = ["orientation_score", "primary_category"] if v2 else []
         with (output / "decision-trace.csv").open("w", newline="", encoding="utf-8") as stream:
             writer = csv.DictWriter(stream, fieldnames=["category", "frame_number", "timestamp_seconds", "score",
-                "category_score", "framing_score", "margin", "match", "framing", "quality", "status", "slot",
-                "selected_frame", "similarity"])
+                "category_score", "framing_score", "margin", *extra, "match", "framing", "quality", "status", "slot",
+                *(["view"] if v2 else []), "selected_frame", "similarity"])
             writer.writeheader()
             for step in report["decision_trace"]:
                 for row in step["pool"]:
                     writer.writerow({"category": step["category"], **{key: row[key] for key in (
                         "frame_number", "timestamp_seconds", "score", "category_score", "framing_score", "margin")},
-                        **row["components"], **{key: row["decision"].get(key, "") for key in (
-                            "status", "slot", "selected_frame", "similarity")}})
+                        **{key: row.get(key, "") for key in extra}, **row["components"],
+                        **{key: row["decision"].get(key, "") for key in (
+                            "status", "slot", *(["view"] if v2 else []), "selected_frame", "similarity")}})
         return
     with (output / "decision-trace.csv").open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=["step", "phase", "feedback_example", "winner",
@@ -674,7 +708,7 @@ def replay_selection(selection, output):
     if report.get("version") not in DECISION_FILES or report.get("review") is not None:
         raise ValueError("Replay requires a current automatic selection with no review override")
     best_view = report["version"] == VIEW_VERSION
-    required = report["version"] == REQUIRED_VERSION
+    required = report["version"] in REQUIRED_VERSIONS
     decision_file = DECISION_FILES[report["version"]]
     if report["reproducibility"]["decision_source_sha256"] != file_hash(Path(__file__).with_name(decision_file)):
         raise ValueError("Decision code changed; use the recorded code version for exact replay")
@@ -687,14 +721,21 @@ def replay_selection(selection, output):
     coverage = report.get("coverage")
     if required:
         requirements = report["requirements"]
-        chosen, coverage, trace, dispositions = rank_required(
-            report["candidates"], np.load(source / "frame-category-scores.npy", allow_pickle=False),
-            np.load(source / "frame-framing-scores.npy", allow_pickle=False), similarities,
-            requirements["categories"], weights=requirements["weights"],
-            duplicate_similarity=settings["frame_duplicate_similarity"],
-            min_separation_seconds=requirements["min_separation_seconds"],
-            extra_slot_min_score=requirements["extra_slot_min_score"],
-            confident_margin=requirements["confident_margin"], possible_margin=requirements["possible_margin"])
+        frozen = [np.load(source / "frame-category-scores.npy", allow_pickle=False),
+                  np.load(source / "frame-framing-scores.npy", allow_pickle=False)]
+        common = dict(weights=requirements["weights"], duplicate_similarity=settings["frame_duplicate_similarity"],
+                      min_separation_seconds=requirements["min_separation_seconds"],
+                      extra_slot_min_score=requirements["extra_slot_min_score"],
+                      confident_margin=requirements["confident_margin"], possible_margin=requirements["possible_margin"])
+        if report["version"] == REQUIRED_V1:
+            chosen, coverage, trace, dispositions = rank_required_v1(
+                report["candidates"], *frozen, similarities, requirements["categories"], **common)
+        else:
+            chosen, coverage, trace, dispositions = rank_required(
+                report["candidates"], *frozen, np.load(source / "frame-orientation-scores.npy", allow_pickle=False),
+                similarities, requirements["categories"], strict_margin=requirements["strict_margin"],
+                orientation_margin=requirements["orientation_margin"],
+                strict_categories=tuple(requirements["strict_categories"]), **common)
     elif best_view:
         chosen, trace, dispositions = rank_views(
             report["candidates"], similarities, report["target_count"], weights=settings["weights"],
@@ -722,7 +763,8 @@ def replay_selection(selection, output):
         if (source / folder).exists():
             shutil.copytree(source / folder, output / folder)
     for name in ("frame-embeddings.npy", "frame-layouts.npy", "frame-similarities.npy", "selected-frames.zip",
-                 *(("frame-category-scores.npy", "frame-framing-scores.npy") if required else ())):
+                 *(("frame-category-scores.npy", "frame-framing-scores.npy") if required else ()),
+                 *(("frame-orientation-scores.npy",) if report["version"] == REQUIRED_VERSION else ())):
         shutil.copyfile(source / name, output / name)
     if "sampling.json" in report["files"]:
         shutil.copyfile(source / "sampling.json", output / "sampling.json")

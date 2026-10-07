@@ -138,7 +138,7 @@ def main(argv: list[str] | None = None) -> int:
     select.add_argument("--top-k", type=positive_int, help="Optional maximum exported photos; best-view mode has no default cap")
     select.add_argument("--selection-mode", choices=("best-view", "legacy", "required-views"), default="best-view",
                         help="required-views: best photo(s) per vehicle_angles.md category (needs --requirements)")
-    select.add_argument("--requirements", type=Path, help="index-requirements v2 directory built from the query's index")
+    select.add_argument("--requirements", type=Path, help="index-requirements v4 directory built from the query's index")
     select.add_argument("--duplicate-similarity", type=float,
                         help="Duplicate-view cosine (default 0.85; required-views within a category: FG-CLIP 2 0.92, SigLIP 2 0.955)")
     select.add_argument("--temporal-similarity", type=float,
@@ -150,7 +150,13 @@ def main(argv: list[str] | None = None) -> int:
     select.add_argument("--confident-margin", type=float, default=0.01,
                         help="required-views: flag a category for checking below this top-category margin")
     select.add_argument("--possible-margin", type=float, default=0.02,
-                        help="required-views: report (not export) categories this close to a frame's top category")
+                        help="required-views: report (not export) categories this close to a frame's top category; "
+                             "also how close whole-car frames must be to fill the front/rear vehicle slots")
+    select.add_argument("--strict-margin", type=float, default=0.02,
+                        help="required-views: runner-up margin needed by often-wrong categories (roof accessories, "
+                             "snorkel, fuel filter, engine cold side, pedals, glovebox, rear heater controls)")
+    select.add_argument("--orientation-margin", type=float, default=0.02,
+                        help="required-views: front (>= margin) or rear (<= -margin) score for the vehicle's front/rear photos")
     select.add_argument("--temporal-gap-seconds", type=positive_float, default=2.0, help="Maximum gap within a continuous view group")
     select.add_argument("--batch-size", type=positive_int, default=16)
     select.add_argument("--extraction-device", choices=("auto", "cpu", "cuda"), default="auto")
@@ -225,6 +231,7 @@ def main(argv: list[str] | None = None) -> int:
                 temporal_gap_seconds=args.temporal_gap_seconds, requirements=args.requirements,
                 confident_margin=args.confident_margin, possible_margin=args.possible_margin,
                 min_separation_seconds=args.min_view_separation_seconds,
+                strict_margin=args.strict_margin, orientation_margin=args.orientation_margin,
                 extra_slot_min_score=args.extra_slot_min_score), indent=2))
         elif args.command == "semantic-label":
             from .labelling import label_index

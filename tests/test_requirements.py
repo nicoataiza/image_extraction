@@ -6,7 +6,7 @@ import unittest
 import numpy as np
 
 from image_extraction.requirements import (
-    OTHER_ID, assignment_scores, framing_scores, knn_scores, label_table, mine_references, parse_spec, required_slots,
+    OTHER_ID, assignment_scores, framing_scores, split_orientation, term_scores, top_overlap, wordings, knn_scores, label_table, mine_references, parse_spec, required_slots,
     split_framing,
 )
 
@@ -150,6 +150,42 @@ class FramingTests(unittest.TestCase):
                    {"reference_offset": 2, "reference_count": 1, "framing_good": [], "framing_poor": []}]
         scores = framing_scores(np.array([[1, 0], [0, 1]], dtype=np.float32), references, records, k=1)
         np.testing.assert_allclose(scores, [[1, 0], [-1, 0]])
+
+
+class OrientationTests(unittest.TestCase):
+    def test_split_uses_best_front_minus_best_rear_view_prompt(self):
+        # Prompts: two front views ([1, 0] and [.6, .8]) against one rear view ([0, 1]).
+        references = np.array([[1, 0], [0, 1], [.6, .8], [.8, -.6], [0, 1]], dtype=np.float32)
+        front, rear = split_orientation(references, np.array([[1, 0], [.6, .8]]), np.array([[0, 1]]), fraction=0.4)
+        self.assertEqual((front, rear), ([0, 3], [1, 4]))
+
+    def test_orientation_score_reuses_group_contrast(self):
+        references = np.array([[1, 0], [0, 1]], dtype=np.float32)
+        records = [{"reference_offset": 0, "reference_count": 2, "orientation_front": [0], "orientation_rear": [1]},
+                   {"reference_offset": 0, "reference_count": 2, "framing_good": [0], "framing_poor": [1]}]
+        scores = framing_scores(np.array([[1, 0], [0, 1]], dtype=np.float32), references, records, k=1,
+                                groups=("orientation_front", "orientation_rear"))
+        np.testing.assert_allclose(scores, [[1, 0], [-1, 0]])
+
+
+class WordingTests(unittest.TestCase):
+    def test_misread_wording_is_replaced_and_equivalents_are_added(self):
+        self.assertEqual(wordings("a photo of a vehicle's front left guard."), ["a photo of a vehicle's front left fender."])
+        self.assertEqual(wordings("a photo of a vehicle's door trims."), ["a photo of a vehicle's interior door trims."])
+        self.assertEqual(wordings("interior door trim/card."), ["interior door trim/card."])   # no "interior interior"
+        self.assertEqual(wordings("a photo of a vehicle's wheels and tyres."),
+                         ["a photo of a vehicle's wheels and tyres.", "a photo of a vehicle's wheels and tires."])
+        self.assertEqual(wordings("a wide view of the engine bay with both inner guards and the bonnet."),
+                         ["a wide view of the engine bay with both inner fenders and the bonnet.",
+                          "a wide view of the engine bay with both inner fenders and the hood."])
+        self.assertEqual(wordings("a photo of a vehicle's battery."), ["a photo of a vehicle's battery."])
+
+    def test_terms_score_their_best_wording_and_overlap_counts_shared_top_images(self):
+        scores = np.array([[.1, .3, .2], [.4, .1, .0]])
+        np.testing.assert_allclose(term_scores(scores, [[0, 1], [2]]), [[.3, .2], [.4, .0]])
+        first, second = np.arange(10.0), np.arange(10.0)
+        second[[0, 9]] = second[[9, 0]]
+        self.assertEqual(top_overlap(first, second, top=3), 2)
 
 
 if __name__ == "__main__":

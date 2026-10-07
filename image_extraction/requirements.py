@@ -6,6 +6,10 @@ category become an image-space reference set. Video frames are then compared wit
 those references (k nearest neighbours), which avoids the large text/image cosine gap.
 Each category's `framing`/`avoid` text then splits its references into well- and
 poorly-framed quartiles; frames are scored by which group they resemble more.
+Whole-vehicle references are likewise split into front- and rear-facing groups by
+their view prompts, so a frame's front/rear orientation is scored the same way.
+The specification is in Australian English. Prompts are reworded where the encoder
+reads that wording differently (see VOCABULARY_*); each prompt term scores its best wording.
 Assignments are unreviewed pseudo-labels, not detections or ground truth.
 """
 
@@ -26,7 +30,28 @@ from .indexing import ensure_separate, file_hash, load_index
 from .labelling import validate_vectors
 from .semantic import SemanticDescriptor
 
-REQUIREMENTS_VERSION = "angle-requirements-knn-v2"
+REQUIREMENTS_VERSION = "angle-requirements-knn-v4"
+# Categories whose references are split by orientation: (front-facing views, rear-facing views).
+# Only the whole vehicle: door mirror "front"/"rear" views mean glass versus housing, not the car.
+ORIENTED_VIEWS = {"vehicle_exterior": (("front", "front-left", "front-right"), ("rear", "rear-left", "rear-right"))}
+ORIENTATION_FRACTION = 0.2
+# Prompt wording, checked on the FG-CLIP 2 index by comparing the top 200 collection images of
+# each wording (October 2; agent visual check). Replace: the spec wording retrieves something
+# else, so only the substitute is prompted. Add: both retrieve the part; a term scores the better.
+VOCABULARY_REPLACE = (
+    (r"\bguard(s?)\b", r"fender\1"),                          # "front guard" gave bull bars (2/200 shared)
+    (r"(?<!interior )\bdoor trim(s?)\b", r"interior door trim\1"),  # "door trims" gave exterior doors (<=9/200)
+    (r"\bconsole lid\b", "center console armrest"),            # "console lid" gave sun visors and gloveboxes
+)
+VOCABULARY_ADD = (
+    (r"\btyre(s?)\b", r"tire\1"), (r"\bbonnet\b", "hood"), (r"\btowbar\b", "tow hitch"), (r"\bcentre\b", "center"),
+    (r"\bglovebox\b", "glove compartment"), (r"\bsunvisor(s?)\b", r"sun visor\1"),
+    (r"\bindicator stalk\b", "turn signal stalk"), (r"\b(?:headlining|roof lining)\b", "headliner"),
+    (r"\bwing mirror\b", "side mirror"), (r"\bgear lever\b", "gear shift"), (r"\bairbox\b", "air filter housing"),
+    (r"\bcombination switch(es)?\b", r"multifunction switch\1"), (r"\bdoor card\b", "interior door panel"),
+    (r"\bcompliance plate\b", "vehicle certification label"),
+)
+AUDIT_TOP = 200
 LIST_KEYS = ("views", "sides", "parts", "aliases")
 SCALAR_KEYS = ("id", "description", "capture", "optional", "requirement", "framing", "avoid")
 OTHER_ID = "_other"
@@ -141,27 +166,61 @@ def framing_prompts(category):
             "source": "spec" if category.get("framing") else "default"}
 
 
+def wordings(prompt):
+    """The prompt as encoded: replacements applied, plus an added-vocabulary wording if it differs."""
+    base = prompt
+    for pattern, replacement in VOCABULARY_REPLACE:
+        base = re.sub(pattern, replacement, base, flags=re.IGNORECASE)
+    added = base
+    for pattern, replacement in VOCABULARY_ADD:
+        added = re.sub(pattern, replacement, added, flags=re.IGNORECASE)
+    return [base] if added == base else [base, added]
+
+
+def term_scores(wording_scores, term_rows):
+    """Per prompt term: its best-matching wording (column max)."""
+    return np.stack([wording_scores[:, rows].max(axis=1) for rows in term_rows], axis=1)
+
+
+def top_overlap(first, second, top=AUDIT_TOP):
+    """Shared images among two score columns' top `top` (a wording-agreement check, not accuracy)."""
+    pick = lambda column: set(np.argpartition(-column, top)[:top].tolist()) if len(column) > top else set(range(len(column)))
+    return len(pick(first) & pick(second))
+
+
 def split_framing(reference_vectors, framing_vectors, avoid_vectors, *, fraction=0.25):
     """Indices of the best- and worst-framed references by text contrast (top/bottom fraction).
 
     Ties use six-decimal scores then reference order. Fewer than four references give
     empty groups, which makes the framing score neutral for that category.
     """
-    count = len(reference_vectors)
+    return _split_by_contrast((reference_vectors @ framing_vectors.T).mean(axis=1)
+                              - (reference_vectors @ avoid_vectors.T).mean(axis=1), fraction)
+
+
+def split_orientation(reference_vectors, front_vectors, rear_vectors, *, fraction=ORIENTATION_FRACTION):
+    """Indices of the most front- and rear-facing references: best front-view prompt minus best rear-view prompt."""
+    return _split_by_contrast((reference_vectors @ front_vectors.T).max(axis=1)
+                              - (reference_vectors @ rear_vectors.T).max(axis=1), fraction)
+
+
+def _split_by_contrast(contrast, fraction):
+    count = len(contrast)
     size = int(count * fraction)
     if size < 1:
         return [], []
-    contrast = np.round((reference_vectors @ framing_vectors.T).mean(axis=1)
-                        - (reference_vectors @ avoid_vectors.T).mean(axis=1), 6)
-    order = np.lexsort((np.arange(count), -contrast))
+    order = np.lexsort((np.arange(count), -np.round(contrast, 6)))
     return sorted(order[:size].tolist()), sorted(order[-size:].tolist())
 
 
-def framing_scores(frames, references, records, k=5):
-    """Per category: mean top-k cosine to well-framed minus poorly-framed references (0 if unsplit)."""
+def framing_scores(frames, references, records, k=5, groups=("framing_good", "framing_poor")):
+    """Per category: mean top-k cosine to well-framed minus poorly-framed references (0 if unsplit).
+
+    With groups=("orientation_front", "orientation_rear") the same contrast scores front versus rear.
+    """
     scores = np.zeros((len(frames), len(records)))
     for c, record in enumerate(records):
-        good, poor = record.get("framing_good", []), record.get("framing_poor", [])
+        good, poor = record.get(groups[0], []), record.get(groups[1], [])
         if not good or not poor:
             continue
         offset = record["reference_offset"]
@@ -177,7 +236,7 @@ def category_spans(records):
 
 
 def load_requirement_index(path):
-    """Verified v2 requirement artifacts for scoring frames (categories, records, reference vectors)."""
+    """Verified v4 requirement artifacts for scoring frames (categories, records, reference vectors)."""
     path = Path(path).expanduser().resolve()
     manifest = json.loads((path / "manifest.json").read_text())
     status = json.loads((path / "status.json").read_text())
@@ -297,11 +356,30 @@ def build_requirement_index(index, spec, output, *, device="auto", model_cache=N
             prompts += category["framing_prompts"][role]
             owner += [c] * len(category["framing_prompts"][role])
             roles += [role] * len(category["framing_prompts"][role])
-    prompt_vectors, runtime = descriptor.encode_text(prompts)
+    # Each prompt term is encoded in every wording; the term scores its best one.
+    texts, term_rows, sources = [], [], []
+    for prompt in prompts:
+        words = wordings(prompt)
+        term_rows.append(list(range(len(texts), len(texts) + len(words))))
+        texts += words
+        sources += ["spec" if words[0] == prompt else "replaced"] + ["added"] * (len(words) - 1)
+    replaced = sorted({p for p, w in zip(prompts, term_rows) if sources[w[0]] == "replaced"})
+    prompt_vectors, runtime = descriptor.encode_text(texts + replaced)
+    original_vectors, prompt_vectors = prompt_vectors[len(texts):], prompt_vectors[:len(texts)]
     print(f"Scoring {len(images):,} stored image vectors...", file=sys.stderr)
     vectors = backend.index.reconstruct_n(0, len(images))
     validate_vectors(vectors, len(images), descriptor.dimension)
-    prompt_scores = vectors @ prompt_vectors.T
+    wording_scores = vectors @ prompt_vectors.T
+    prompt_scores = term_scores(wording_scores, term_rows)
+    audit = []
+    for t, rows in enumerate(term_rows):
+        if len(rows) > 1 or sources[rows[0]] == "replaced":
+            pair = (texts[rows[0]], texts[rows[1]]) if len(rows) > 1 else (prompts[t], texts[rows[0]])
+            other = (wording_scores[:, rows[1]] if len(rows) > 1 else
+                     vectors @ original_vectors[replaced.index(prompts[t])])
+            audit.append({"label": labels[owner[t]]["id"], "role": roles[t], "spec": prompts[t],
+                          "kind": "added" if len(rows) > 1 else "replaced", "first": pair[0], "second": pair[1],
+                          f"top{AUDIT_TOP}_shared": top_overlap(wording_scores[:, rows[0]], other)})
     label_scores = assignment_scores(prompt_scores, owner, base_count, variant_end, len(labels))
     mined = mine_references(vectors, label_scores, prompt_scores[:, :variant_end], labels, owner[:variant_end],
                             per_category=per_category)
@@ -313,22 +391,36 @@ def build_requirement_index(index, spec, output, *, device="auto", model_cache=N
     for c, item in enumerate(mined):
         good = poor = []
         if c < len(categories):
-            role_vectors = {role: prompt_vectors[[p for p in range(len(prompts)) if owner[p] == c and roles[p] == role]]
+            # Framing contrast averages every wording of the category's framing and avoid rules.
+            role_vectors = {role: prompt_vectors[[r for p in range(len(prompts)) if owner[p] == c and roles[p] == role
+                                                  for r in term_rows[p]]]
                             for role in ("framing", "avoid")}
             good, poor = split_framing(vectors[item["rows"]], role_vectors["framing"], role_vectors["avoid"])
+        front = rear = []
+        if item["id"] in ORIENTED_VIEWS:
+            category = categories[c]
+            missing = [v for views in ORIENTED_VIEWS[item["id"]] for v in views if v not in category["views"]]
+            if missing:
+                raise ValueError(f"{item['id']} needs views {missing} for front/rear orientation")
+            first = base_count + sum(len(other["variant_prompts"]) for other in categories[:c])
+            rows_for = lambda views: [r for v in views for r in term_rows[first + category["views"].index(v)]]
+            front, rear = split_orientation(vectors[item["rows"]], *(prompt_vectors[rows_for(views)]
+                                                                     for views in ORIENTED_VIEWS[item["id"]]))
         records.append({"id": item["id"], "assigned_images": item["assigned_images"],
                         "reference_offset": offset, "reference_count": len(item["rows"]),
                         "framing_good": good, "framing_poor": poor,
+                        "orientation_front": front, "orientation_rear": rear,
                         "references": [{"image_id": images[r]["id"], "relative_path": images[r]["relative_path"],
                                         "label_score": round(float(label_scores[r, c]), 6)} for r in item["rows"]]})
         offset += len(item["rows"])
     write_json(output / "mined.json", records)
     write_json(output / "categories.json", categories)
     with (output / "prompts.jsonl").open("w", encoding="utf-8") as stream:
-        for p, text in enumerate(prompts):
-            stream.write(json.dumps({"row": p, "label": labels[owner[p]]["id"], "prompt": text,
-                                     "role": roles[p]}) + "\n")
-    render_gallery(output, root, categories, records, warnings, gallery_size)
+        for t, rows in enumerate(term_rows):
+            for r in rows:
+                stream.write(json.dumps({"row": r, "term": t, "label": labels[owner[t]]["id"], "prompt": texts[r],
+                                         "spec_prompt": prompts[t], "wording": sources[r], "role": roles[t]}) + "\n")
+    render_gallery(output, root, categories, records, warnings, gallery_size, audit)
     summary = {"status": "complete", "version": REQUIREMENTS_VERSION,
         "created_at": datetime.now(timezone.utc).isoformat(), "spec": str(spec), "spec_sha256": file_hash(spec),
         "index": str(index), "index_manifest_sha256": file_hash(index / "manifest.json"),
@@ -341,13 +433,21 @@ def build_requirement_index(index, spec, output, *, device="auto", model_cache=N
         "method": ("The larger of mean base-prompt cosine and best view/part variant cosine assigns each stored "
                    "image to one category or background; "
                    "each category keeps a round-robin of its prompts' strongest assigned images. "
-                   "Framing minus avoid prompt cosine splits each category's references into top and bottom quartiles."),
-        "framing_fraction": 0.25,
+                   "Framing minus avoid prompt cosine splits each category's references into top and bottom quartiles. "
+                   "For the whole vehicle, best front-view minus best rear-view prompt cosine splits its references "
+                   "into front- and rear-facing fifths. Spec prompts are reworded by the vocabulary tables; "
+                   "each prompt term scores its best wording, and framing contrast averages wordings."),
+        "vocabulary": {"replace": [list(v) for v in VOCABULARY_REPLACE], "add": [list(v) for v in VOCABULARY_ADD]},
+        "vocabulary_audit": audit,
+        "framing_fraction": 0.25, "orientation_fraction": ORIENTATION_FRACTION,
+        "oriented_views": ORIENTED_VIEWS,
         "limitations": ["Mined references are unreviewed zero-shot pseudo-labels, not ground truth.",
             "Cosines are uncalibrated; fine engine-bay parts and similar controls are often confused.",
             "Left/right entries set photo counts only; sides are not recognised or verified.",
             "Optional categories cannot be confirmed absent from weak matches.",
-            "Framing groups are learned from text contrast; they do not measure object boundaries or text legibility."],
+            "Framing groups are learned from text contrast; they do not measure object boundaries or text legibility.",
+            "Front/rear groups come from view prompts; left and right sides are not distinguished.",
+            f"Vocabulary tables were chosen from FG-CLIP 2 top-{AUDIT_TOP} retrieval checks; untested for SigLIP 2."],
         "files": {name: {"sha256": file_hash(output / name)} for name in
                   ("categories.json", "mined.json", "prompts.jsonl", "prompt-embeddings.npy",
                    "label-scores.npy", "reference-vectors.npy")}}
@@ -356,7 +456,7 @@ def build_requirement_index(index, spec, output, *, device="auto", model_cache=N
     return {key: summary[key] for key in ("status", "category_count", "parse_warnings", "elapsed_seconds")}
 
 
-def render_gallery(output, root, categories, records, warnings, gallery_size):
+def render_gallery(output, root, categories, records, warnings, gallery_size, audit=()):
     """Audit page: what each category learned from the unlabeled collection."""
     (output / "thumbnails").mkdir()
     spec = {c["id"]: c for c in categories}
@@ -392,9 +492,13 @@ def render_gallery(output, root, categories, records, warnings, gallery_size):
         framing = ""
         if category and record.get("framing_good"):
             groups = []
-            for label, key in (("Best framed", "framing_good"), ("Worst framed", "framing_poor")):
+            shown = [("Best framed", "framing_good"), ("Worst framed", "framing_poor")]
+            if record.get("orientation_front"):
+                shown += [("Front-facing", "orientation_front"), ("Rear-facing", "orientation_rear")]
+            for label, key in shown:
                 figures = []
-                for i in record[key][:6] if key == "framing_good" else record[key][-6:]:
+                members = record[key]
+                for i in members[-6:] if key == "framing_poor" else members[:6]:
                     ref = record["references"][i]
                     target = f"thumbnails/{ref['image_id']}.jpg"
                     if not (output / target).exists():
@@ -414,13 +518,21 @@ def render_gallery(output, root, categories, records, warnings, gallery_size):
                         f'collection images assigned · {record["reference_count"]:,} kept as references</p>'
                         f'<div class="g">{"".join(cards)}</div>{framing}</section>')
     notes = "".join(f"<li>{html.escape(w)}</li>" for w in warnings) or "<li>None</li>"
+    key = f"top{AUDIT_TOP}_shared"
+    wording = "".join(f'<tr><td>{html.escape(a["label"])}</td><td>{a["kind"]}</td><td>{html.escape(a["first"])}</td>'
+                      f'<td>{html.escape(a["second"])}</td><td>{a[key]}{" · check" if a[key] < 50 else ""}</td></tr>'
+                      for a in sorted(audit, key=lambda a: a[key]))
     page = f'''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Required category references</title><style>body{{font:15px system-ui;margin:24px;background:#f4f6f8;color:#17202a}}
 section{{background:#fff;border-radius:8px;padding:12px 16px;margin:16px 0}}.g{{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px}}
-figure{{margin:0}}img{{width:100%;height:150px;object-fit:contain;background:#eee}}figcaption{{font-size:11px;overflow-wrap:anywhere}}.m{{color:#555}}</style>
+figure{{margin:0}}img{{width:100%;height:150px;object-fit:contain;background:#eee}}td,th{{text-align:left;padding:3px 8px;font-size:13px}}figcaption{{font-size:11px;overflow-wrap:anywhere}}.m{{color:#555}}</style>
 <h1>Required category references</h1><p>Each category's reference photos were chosen by zero-shot text matching against the
 unlabeled collection. They are unreviewed pseudo-labels: check that each gallery shows the intended part before trusting video assignments.
 Captions show the image path and mean prompt cosine (uncalibrated, not a probability).</p>
 <p><a href="manifest.json">Provenance</a> · <a href="mined.json">All references</a></p><h2>Specification parse warnings</h2><ul>{notes}</ul>
+<h2>Prompt wording</h2><p class="m">Australian wording the encoder misreads is replaced; equivalent US wording is added and each
+term scores its better wording. Shared images among each pair's top {AUDIT_TOP} collection matches (for replacements: spec
+wording versus substitute). Low agreement is expected for replacements and worth checking for additions.</p>
+<table><tr><th>Category</th><th>Kind</th><th>Wording</th><th>Alternative</th><th>Shared</th></tr>{wording}</table>
 {"".join(sections)}</html>'''
     (output / "report.html").write_text(page, encoding="utf-8")

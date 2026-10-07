@@ -206,7 +206,7 @@ class SelectionExportTests(unittest.TestCase):
         self.assertEqual(original["selected_frame_numbers"], replayed["selected_frame_numbers"])
         self.assertEqual((target / "decision-trace.csv").read_bytes(), (self.output / "decision-trace.csv").read_bytes())
 
-    def make_requirements(self):
+    def make_requirements(self, oriented=False):
         from image_extraction.requirements import REQUIREMENTS_VERSION
         path = self.root / "requirements"; path.mkdir()
         categories = [{"id": "red_part", "name": "Red part", "section": "Exterior", "slots": 1, "optional": False},
@@ -218,6 +218,8 @@ class SelectionExportTests(unittest.TestCase):
                     "framing_good": [0], "framing_poor": [1]} for k, c in enumerate(categories)]
         records.append({"id": "_other", "reference_offset": 6, "reference_count": 0})
         records[2]["reference_offset"], records[2]["reference_count"] = 4, 2
+        if oriented:   # red part: reference 0 faces front, reference 1 rear
+            records[0].update(orientation_front=[0], orientation_rear=[1])
         (path / "categories.json").write_text(json.dumps(categories))
         (path / "mined.json").write_text(json.dumps(records))
         (path / "status.json").write_text(json.dumps({"status": "complete"}))
@@ -232,18 +234,40 @@ class SelectionExportTests(unittest.TestCase):
         requirements = self.make_requirements()
         self.run_selection(selection_mode="required-views", requirements=requirements)
         d = json.loads((self.output / "selection.json").read_text())
-        self.assertEqual(d["version"], "required-category-views-v1")
+        self.assertEqual(d["version"], "required-category-views-v2")
+        self.assertFalse(d["requirements"]["categories"][0]["oriented"])
         status = {c["category"]: c["status"] for c in d["coverage"]}
         self.assertEqual(status, {"red_part": "found", "blue_part": "found", "green_part": "optional_not_found"})
         exports = sorted(p.name for p in (self.output / "selected").iterdir())
         self.assertEqual(exports, ["01-red_part-1-frame-00000000.png", "02-blue_part-1-frame-00000001.png"])
         self.assertTrue((self.output / "frame-category-scores.npy").is_file())
+        self.assertTrue((self.output / "frame-orientation-scores.npy").is_file())
         self.assertIn("Red part", (self.output / "report.html").read_text())
         shutil.rmtree(self.query); shutil.rmtree(self.collection); shutil.rmtree(requirements)
         target = self.root / "replayed"
         with patch("image_extraction.selection.load_index", side_effect=AssertionError("index loaded")):
             self.assertTrue(replay_selection(self.output / "selection.json", target)["replay_identical"])
         self.assertEqual(json.loads((target / "selection.json").read_text())["coverage"], d["coverage"])
+
+    def test_required_views_exports_front_view_and_replays_orientation(self):
+        import shutil
+        requirements = self.make_requirements(oriented=True)
+        # The red frame is 0.006 closer to the front reference than the rear one.
+        self.run_selection(selection_mode="required-views", requirements=requirements, orientation_margin=0.005)
+        d = json.loads((self.output / "selection.json").read_text())
+        red = d["coverage"][0]
+        self.assertEqual(red["orientation"], {"front": 0, "rear": None})
+        self.assertEqual(sorted(p.name for p in (self.output / "selected").iterdir())[0],
+                         "01-red_part-front-frame-00000000.png")
+        self.assertIn("no clear rear view", (self.output / "report.html").read_text())
+        self.assertIn("view", (self.output / "decision-trace.csv").read_text().splitlines()[0])
+        shutil.rmtree(requirements)
+        target = self.root / "replayed"
+        self.assertTrue(replay_selection(self.output / "selection.json", target)["replay_identical"])
+        with (self.output / "frame-orientation-scores.npy").open("ab") as stream:
+            stream.write(b"changed")
+        with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+            replay_selection(self.output / "selection.json", self.root / "tampered")
 
     def test_required_views_rejects_mismatched_index_and_held_out_feedback(self):
         requirements = self.make_requirements()

@@ -310,6 +310,7 @@
 - capture: medium
 - aliases:
   - glove box
+  - glove comparment
 
 ## Head unit
 - id: `head_unit`
