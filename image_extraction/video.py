@@ -1,9 +1,13 @@
 """Bounded video decoding with PySceneDetect cuts and presentation timestamps."""
 
 from bisect import bisect_left
+from concurrent.futures import ThreadPoolExecutor
+import os
 from pathlib import Path
 import math
+import queue
 import sys
+import threading
 import time
 
 import numpy as np
@@ -18,7 +22,59 @@ def require_video():
     return cv2, scenedetect
 
 
-def detect_shots(path, *, threshold=27.0, min_scene_frames=15, collect_sampling_metrics=False):
+ANALYSIS_MAX_SIDE = 320
+
+
+def _downscale(frame, cv2):
+    """Analysis copy at most ANALYSIS_MAX_SIDE pixels; exports are decoded again at native size."""
+    height, width = frame.shape[:2]
+    factor = min(1.0, ANALYSIS_MAX_SIDE / max(width, height))
+    return cv2.resize(frame, (max(1, round(width * factor)), max(1, round(height * factor))),
+                      interpolation=cv2.INTER_AREA)
+
+
+def _scan_frames(cap, cv2, workers):
+    """Yield (timestamp, (width, height), analysis frame) in decode order.
+
+    Full-resolution decoding runs on a producer thread and downscaling on a thread pool
+    (OpenCV releases the GIL), so only small frames reach the sequential analysis. The
+    downscale is the same deterministic INTER_AREA resize, so results are unchanged.
+    """
+    pending, stop = queue.Queue(maxsize=4 * workers), threading.Event()
+
+    def produce(pool):
+        try:
+            while not stop.is_set():
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                timestamp = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
+                pending.put((timestamp, (frame.shape[1], frame.shape[0]), pool.submit(_downscale, frame, cv2)))
+        except BaseException as error:  # Surface decoder errors in the consuming thread.
+            pending.put(error)
+        finally:
+            pending.put(None)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        producer = threading.Thread(target=produce, args=(pool,), daemon=True)
+        producer.start()
+        try:
+            while (item := pending.get()) is not None:
+                if isinstance(item, BaseException):
+                    raise item
+                timestamp, size, future = item
+                yield timestamp, size, future.result()
+        finally:
+            stop.set()
+            while producer.is_alive():
+                try:
+                    pending.get(timeout=0.1)
+                except queue.Empty:
+                    pass
+            producer.join()
+
+
+def detect_shots(path, *, threshold=27.0, min_scene_frames=15, collect_sampling_metrics=False, workers=None):
     if not math.isfinite(threshold) or threshold <= 0 or min_scene_frames <= 0:
         raise ValueError("Shot threshold and minimum scene frames must be positive")
     path = Path(path).expanduser().resolve()
@@ -27,6 +83,7 @@ def detect_shots(path, *, threshold=27.0, min_scene_frames=15, collect_sampling_
     cv2, scenedetect = require_video()
     cap = cv2.VideoCapture(str(path))
     started = time.perf_counter()
+    scan = None
     try:
         if not cap.isOpened():
             raise ValueError(f"Cannot decode video: {path}")
@@ -39,17 +96,11 @@ def detect_shots(path, *, threshold=27.0, min_scene_frames=15, collect_sampling_
         cuts, timestamps = [], []
         sampling_metrics, previous_gray = [], None
         dimensions = None
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
+        workers = workers or min(8, os.cpu_count() or 1)
+        scan = _scan_frames(cap, cv2, workers)
+        for timestamp, dimensions, small in scan:
             number = len(timestamps)
-            timestamps.append(cap.get(cv2.CAP_PROP_POS_MSEC) / 1000)
-            height, width = frame.shape[:2]
-            dimensions = (width, height)
-            factor = min(1.0, 320 / max(width, height))
-            small = cv2.resize(frame, (max(1, round(width * factor)), max(1, round(height * factor))),
-                               interpolation=cv2.INTER_AREA)
+            timestamps.append(timestamp)
             if collect_sampling_metrics:
                 from .sampling import measure_frame
                 gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
@@ -66,6 +117,8 @@ def detect_shots(path, *, threshold=27.0, min_scene_frames=15, collect_sampling_
         cuts.extend(cut.frame_num for cut in detector.post_process(
             scenedetect.FrameTimecode(len(timestamps) - 1, fps=fps)))
     finally:
+        if scan is not None:
+            scan.close()  # Stops and joins the decoder thread before the capture is released.
         cap.release()
     timestamp_source = "opencv_presentation_time"
     if (not np.isfinite(timestamps).all() or timestamps[0] < 0
@@ -84,7 +137,8 @@ def detect_shots(path, *, threshold=27.0, min_scene_frames=15, collect_sampling_
             "width": dimensions[0], "height": dimensions[1], "end_seconds": end_seconds,
             "timestamp_source": timestamp_source, "final_frame_duration_estimated": True,
             "scene_detector": {"name": "ContentDetector", "threshold": threshold,
-                               "min_scene_frames": min_scene_frames, "max_side": 320},
+                               "min_scene_frames": min_scene_frames, "max_side": ANALYSIS_MAX_SIDE,
+                               "downscale": "INTER_AREA on a thread pool", "workers": workers},
             "versions": {"opencv": cv2.__version__, "scenedetect": scenedetect.__version__},
             "scan_seconds": time.perf_counter() - started}
     if collect_sampling_metrics:

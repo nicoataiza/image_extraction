@@ -200,6 +200,33 @@ class RetrievalTests(unittest.TestCase):
         for number, pts, _ in decoded:
             self.assertAlmostEqual(pts, times[number], places=3)
 
+    def test_parallel_downscale_matches_serial_and_decoder_errors_surface(self):
+        import threading
+        video = self.video()
+        serial = detect_shots(video, min_scene_frames=5, collect_sampling_metrics=True, workers=1)
+        parallel = detect_shots(video, min_scene_frames=5, collect_sampling_metrics=True, workers=4)
+        self.assertEqual(serial[1:], parallel[1:])
+        self.assertEqual(serial[0]["sampling_metrics"], parallel[0]["sampling_metrics"])
+        original_capture = cv2.VideoCapture
+
+        class FailingCapture:
+            def __init__(self, path):
+                self.capture, self.reads = original_capture(path), 0
+
+            def read(self):
+                self.reads += 1
+                if self.reads == 12:
+                    raise RuntimeError("decoder failed")
+                return self.capture.read()
+
+            def __getattr__(self, name):
+                return getattr(self.capture, name)
+
+        threads = threading.active_count()
+        with patch.object(cv2, "VideoCapture", FailingCapture), self.assertRaisesRegex(RuntimeError, "decoder failed"):
+            detect_shots(video, min_scene_frames=5, workers=2)
+        self.assertEqual(threading.active_count(), threads)
+
     def test_no_cuts_is_one_shot_and_interval_sampling_stays_inside(self):
         _, shots, times = detect_shots(self.video(cuts=False))
         self.assertEqual(len(shots), 1)
